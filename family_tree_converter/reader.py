@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime
 import re
 from dataclasses import dataclass, field
@@ -129,6 +130,10 @@ def _parse_date(val: Any) -> str | None:
             return str(date_int)
         if 1 <= month <= 12:
             if day > 0:
+                # Clamp impossible days (e.g. 29 FEB 1978, a data error) to
+                # the last valid day of the month rather than emitting junk.
+                last_day = calendar.monthrange(year, month)[1]
+                day = min(day, last_day)
                 return f"{day} {_MONTHS[month - 1]} {year}"
             return f"{_MONTHS[month - 1]} {year}"
         return str(year)

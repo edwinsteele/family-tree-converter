@@ -62,6 +62,13 @@ def test_parse_date_year_only_not_confused_with_serial():
     assert _parse_date(1760.0) == "1760"
 
 
+def test_parse_date_clamps_impossible_day():
+    # 29 Feb 1978 is not a real date (1978 is not a leap year) -> clamp to 28.
+    assert _parse_date(19780229.0) == "28 FEB 1978"
+    # A valid leap-year 29 Feb is left untouched.
+    assert _parse_date(19800229.0) == "29 FEB 1980"
+
+
 def test_write_gedcom_produces_valid_structure(sample_family, tmp_path):
     individuals, families = sample_family
     output = tmp_path / "test.ged"
