@@ -62,6 +62,47 @@ class Family:
 # Helpers
 # ---------------------------------------------------------------------------
 
+_DECADE_RE = re.compile(
+    r"^(?P<qualifier>early|mid|late|v\.approx\.|approx\.)?\s*(?P<year>\d{4})s?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_approx_string(s: str) -> str | None:
+    """Convert informal approximate date strings to GEDCOM date phrases."""
+    if s in ("?", "??", "unknown"):
+        return None
+
+    # Normalise separators so "mid.1950s" and "mid 1950s" both match
+    normalised = s.replace(".", " ").strip().lower()
+
+    # "v approx YYYY" → "ABT YYYY"
+    m = re.match(r"^v\s+approx\s+(\d{4})$", normalised)
+    if m:
+        return f"ABT {m.group(1)}"
+
+    # "approx YYYY" → "ABT YYYY"
+    m = re.match(r"^approx\s+(\d{4})$", normalised)
+    if m:
+        return f"ABT {m.group(1)}"
+
+    # Decade patterns: "1900s", "mid 1950s", "late 1980s", "early 1900s"
+    m = re.match(r"^(?P<qual>early|mid|late)?\s*(?P<decade>\d{3})0s?$", normalised)
+    if m:
+        base = int(m.group("decade")) * 10
+        qual = m.group("qual")
+        if qual == "early":
+            return f"BET {base} AND {base + 4}"
+        if qual == "mid":
+            return f"BET {base + 3} AND {base + 7}"
+        if qual == "late":
+            return f"BET {base + 6} AND {base + 9}"
+        # bare "1900s"
+        return f"BET {base} AND {base + 9}"
+
+    return s  # pass through unchanged; writer will emit as-is
+
+
 def _parse_date(val: Any) -> str | None:
     """Convert YYYYMMDD float or approximate string to a GEDCOM-friendly date."""
     if val == "" or val is None:
@@ -81,7 +122,34 @@ def _parse_date(val: Any) -> str | None:
             return f"{_MONTHS[month - 1]} {year}"
         return str(year)
     s = str(val).strip()
-    return s or None
+    if not s:
+        return None
+    return _parse_approx_string(s)
+
+
+def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
+    """Parse a parent-column value into (given, surname).
+
+    Returns None when the entry is entirely unknown.
+    Partial names are returned as (None, surname) or (given, None).
+
+    Examples:
+        'James Steele'  → ('James', 'Steele')
+        '?  Hunter'     → (None, 'Hunter')
+        'Joanna  ?'     → ('Joanna', None)
+        '?'             → None
+    """
+    s = " ".join(raw.split())
+    if not s or s == "?":
+        return None
+    parts = s.split()
+    if parts[0] == "?":
+        rest = " ".join(p for p in parts[1:] if p != "?").strip()
+        return (None, rest or None)
+    if parts[-1] == "?":
+        given = " ".join(p for p in parts[:-1] if p != "?").strip()
+        return (given or None, None)
+    return (" ".join(parts[:-1]) or None, parts[-1])
 
 
 def _build_place(*parts: str) -> str | None:
@@ -340,4 +408,78 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             if h.sex == "F":
                 fam.husband_id, fam.wife_id = fam.wife_id, fam.husband_id
 
-    return list(dedup_map.values()), families
+    # ------------------------------------------------------------------
+    # Pass 4 – Synthetic parents for family-head rows
+    #
+    # Husband and wife rows (no '/' in code) carry their parents' names
+    # in columns Q/R but are never assigned FAMC links by the code-based
+    # Pass 3. Here we parse those names, match to existing individuals
+    # where possible, create synthetic Individual records where not, and
+    # wire up parent Family records accordingly.
+    # ------------------------------------------------------------------
+    def _ind_name_key(given: str | None, surname: str | None) -> tuple[str, str]:
+        g_str = (given or "").lower().split("(")[0].strip()
+        g = g_str.split()[0] if g_str else ""
+        return ((surname or "").upper(), g)
+
+    # Name-keyed lookup across all real individuals (first match wins)
+    existing_by_name: dict[tuple[str, str], Individual] = {}
+    for ind in dedup_map.values():
+        k = _ind_name_key(ind.given_name or None, ind.surname or None)
+        if k != ("", ""):
+            existing_by_name.setdefault(k, ind)
+
+    synth_by_name: dict[tuple[str, str], Individual] = {}
+    parent_fams: dict[tuple[str | None, str | None], Family] = {}
+    already_child: set[str] = {cid for fam in families for cid in fam.child_ids}
+
+    def _resolve_parent(
+        parsed: tuple[str | None, str | None] | None, sex: str
+    ) -> Individual | None:
+        nonlocal _id_counter
+        if parsed is None or (parsed[0] is None and parsed[1] is None):
+            return None
+        key = _ind_name_key(parsed[0], parsed[1])
+        parent = existing_by_name.get(key) or synth_by_name.get(key)
+        if parent is None:
+            _id_counter += 1
+            parent = Individual(
+                id=f"I{_id_counter}",
+                given_name=parsed[0] or "",
+                surname=parsed[1] or "",
+                sex=sex,
+            )
+            synth_by_name[key] = parent
+        return parent
+
+    for _, etype, data in all_events:
+        if etype != "person" or data["role"] not in ("husband", "wife"):
+            continue
+        ind = dedup_map[data["dedup_key"]]
+        if ind.id in already_child:
+            continue
+
+        fp = _parse_parent_name(data["father_raw"])
+        mp = _parse_parent_name(data["mother_raw"])
+        if fp is None and mp is None:
+            continue
+
+        father_ind = _resolve_parent(fp, "M")
+        mother_ind = _resolve_parent(mp, "F")
+
+        if father_ind is None and mother_ind is None:
+            continue
+
+        pkey = (
+            father_ind.id if father_ind else None,
+            mother_ind.id if mother_ind else None,
+        )
+        if pkey not in parent_fams:
+            _fam_counter += 1
+            pf = Family(id=f"F{_fam_counter}", husband_id=pkey[0], wife_id=pkey[1])
+            families.append(pf)
+            parent_fams[pkey] = pf
+        parent_fams[pkey].child_ids.append(ind.id)
+        already_child.add(ind.id)
+
+    return list(dedup_map.values()) + list(synth_by_name.values()), families

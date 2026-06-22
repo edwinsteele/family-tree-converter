@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from family_tree_converter.reader import Family, Individual
+from family_tree_converter.reader import Family, Individual, _parse_approx_string
 from family_tree_converter.writer import write_gedcom
 
 
@@ -32,6 +32,23 @@ def sample_family(sample_individual):
         child_ids=["I3"],
     )
     return [sample_individual, wife, child], [family]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("approx.1886",    "ABT 1886"),
+    ("approx.1893",    "ABT 1893"),
+    ("v.approx.1945",  "ABT 1945"),
+    ("v.approx.1925",  "ABT 1925"),
+    ("1900s",          "BET 1900 AND 1909"),
+    ("late 1980s",     "BET 1986 AND 1989"),
+    ("late 1860s",     "BET 1866 AND 1869"),
+    ("mid.1950s",      "BET 1953 AND 1957"),
+    ("mid.1750s",      "BET 1753 AND 1757"),
+    ("mid.1780s",      "BET 1783 AND 1787"),
+    ("?",              None),
+])
+def test_parse_approx_string(raw, expected):
+    assert _parse_approx_string(raw) == expected
 
 
 def test_write_gedcom_produces_valid_structure(sample_family, tmp_path):
