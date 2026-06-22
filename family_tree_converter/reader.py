@@ -255,7 +255,7 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 "date": _parse_date(v(r, _C_DATE1)),
                 "place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
             })
-        elif generation != "" and generation != 0:
+        elif generation != "":
             surname = str(v(r, _C_SURNAME)).strip()
             given = str(v(r, _C_GIVEN)).strip()
             father = str(v(r, _C_FATHER)).strip()
