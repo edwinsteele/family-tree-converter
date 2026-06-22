@@ -259,7 +259,8 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             surname = str(v(r, _C_SURNAME)).strip()
             given = str(v(r, _C_GIVEN)).strip()
             father = str(v(r, _C_FATHER)).strip()
-            code = str(v(r, _C_CODE)).strip()
+            # '|' is an occasional typo for the '/' child separator
+            code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_base = _strip_nee(surname)
 
             person_rows.append({
@@ -327,6 +328,47 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
 
     for p in person_rows:
         _get_or_create(p)
+
+    # ------------------------------------------------------------------
+    # Pass 2b – reconcile the same person recorded in multiple lineage
+    # charts. Someone who bridges several family lines (e.g. appears as a
+    # child in two different ancestral charts) gets distinct dedup keys
+    # because their parent names differ between charts. When the name AND
+    # an exact birth date (day + month + year) match, they are certainly
+    # the same individual: merge them onto one record and repoint the
+    # dedup keys so every chart contributes a parent family. This only
+    # ever merges — a shared birth *year* alone is not enough, so same-
+    # named cousins are never collapsed.
+    # ------------------------------------------------------------------
+    def _has_full_date(d: str | None) -> bool:
+        return bool(d) and any(mon in d for mon in _MONTHS)
+
+    def _merge_into(dst: Individual, src: Individual) -> None:
+        if not dst.birth_place and src.birth_place:
+            dst.birth_place = src.birth_place
+        if not dst.death_date and src.death_date:
+            dst.death_date = src.death_date
+        if not dst.death_place and src.death_place:
+            dst.death_place = src.death_place
+        if not dst.occupation and src.occupation:
+            dst.occupation = src.occupation
+        if dst.sex is None and src.sex:
+            dst.sex = src.sex
+        if not dst.notes and src.notes:
+            dst.notes = src.notes
+
+    strong_canon: dict[tuple, Individual] = {}
+    for dk, ind in list(dedup_map.items()):
+        if not _has_full_date(ind.birth_date):
+            continue
+        given_norm = (ind.given_name or "").lower().split("(")[0].strip()
+        sk = ((ind.surname or "").upper(), given_norm, ind.birth_date)
+        canon = strong_canon.get(sk)
+        if canon is None:
+            strong_canon[sk] = ind
+        elif canon is not ind:
+            _merge_into(canon, ind)
+            dedup_map[dk] = canon
 
     # ------------------------------------------------------------------
     # Pass 3 – build families using code-based role classification
@@ -493,4 +535,12 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         parent_fams[pkey].child_ids.append(ind.id)
         already_child.add(ind.id)
 
-    return list(dedup_map.values()) + list(synth_by_name.values()), families
+    # Pass 2b can point several dedup keys at one merged individual, so
+    # de-duplicate the final list by identity while preserving order.
+    seen_ids: set[str] = set()
+    ordered: list[Individual] = []
+    for ind in list(dedup_map.values()) + list(synth_by_name.values()):
+        if ind.id not in seen_ids:
+            seen_ids.add(ind.id)
+            ordered.append(ind)
+    return ordered, families
