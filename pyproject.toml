@@ -5,6 +5,7 @@ description = "Convert custom Excel family tree spreadsheet to GEDCOM format"
 requires-python = ">=3.11"
 dependencies = [
     "openpyxl>=3.1",
+    "xlrd>=2.0.2",
 ]
 
 [project.optional-dependencies]
