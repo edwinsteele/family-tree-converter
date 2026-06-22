@@ -32,6 +32,16 @@ DATA_START_ROW = 17
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
+# Month names (full and common abbreviations) → GEDCOM 3-letter code.
+_MONTH_NAMES = {
+    "january": "JAN", "jan": "JAN", "february": "FEB", "feb": "FEB",
+    "march": "MAR", "mar": "MAR", "april": "APR", "apr": "APR",
+    "may": "MAY", "june": "JUN", "jun": "JUN", "july": "JUL", "jul": "JUL",
+    "august": "AUG", "aug": "AUG", "september": "SEP", "sept": "SEP",
+    "sep": "SEP", "october": "OCT", "oct": "OCT", "november": "NOV",
+    "nov": "NOV", "december": "DEC", "dec": "DEC",
+}
+
 
 @dataclass
 class Individual:
@@ -46,6 +56,8 @@ class Individual:
     sex: str | None = None
     occupation: str | None = None
     notes: str | None = None
+    # Free-text annotations harvested from Excel cell comments.
+    note_list: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -56,6 +68,8 @@ class Family:
     marriage_date: str | None = None
     marriage_place: str | None = None
     child_ids: list[str] = field(default_factory=list)
+    # Free-text annotations harvested from Excel cell comments on marriage rows.
+    note_list: list[str] = field(default_factory=list)
     # Internal: base code of the husband row, used during construction
     _husband_base: str = field(default="", repr=False, compare=False)
 
@@ -108,6 +122,47 @@ def _parse_approx_string(s: str) -> str | None:
         year = int(m.group(1))
         return f"BET {year} AND {year + 1}"
 
+    # "1828 ??" → uncertain single year → ABT
+    m = re.match(r"^(\d{4})\s*\?+$", s.strip())
+    if m:
+        return f"ABT {m.group(1)}"
+
+    # ISO "1908-09-05" → "5 SEP 1908"; "1908-09" → "SEP 1908"
+    m = re.match(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$", s.strip())
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12:
+            if m.group(3):
+                return f"{int(m.group(3))} {_MONTHS[month - 1]} {year}"
+            return f"{_MONTHS[month - 1]} {year}"
+
+    # Uncertain-decade ISO "194?-02-28" → "BET 1940 AND 1949"
+    m = re.match(r"^(\d{3})\?-\d{2}(?:-\d{2})?$", s.strip())
+    if m:
+        base = int(m.group(1)) * 10
+        return f"BET {base} AND {base + 9}"
+
+    # "pre 1911" → "BEF 1911"; "post/after 1911" → "AFT 1911"
+    m = re.match(r"^(pre|before)\s+(\d{4})$", normalised)
+    if m:
+        return f"BEF {m.group(2)}"
+    m = re.match(r"^(post|after)\s+(\d{4})$", normalised)
+    if m:
+        return f"AFT {m.group(2)}"
+
+    # "c 1920", "ca 1920", "circa 1920" → "ABT 1920"
+    m = re.match(r"^(c|ca|circa)\s+(\d{4})$", normalised)
+    if m:
+        return f"ABT {m.group(2)}"
+
+    # Month-name forms: "April 1888", "Feb. 1948", "5 June 1789"
+    m = re.match(r"^(?:(\d{1,2})\s+)?([a-z]+)\s+(\d{4})$", normalised)
+    if m and m.group(2) in _MONTH_NAMES:
+        mon = _MONTH_NAMES[m.group(2)]
+        if m.group(1):
+            return f"{int(m.group(1))} {mon} {m.group(3)}"
+        return f"{mon} {m.group(3)}"
+
     return s  # pass through unchanged; writer will emit as-is
 
 
@@ -141,6 +196,31 @@ def _parse_date(val: Any) -> str | None:
     if not s:
         return None
     return _parse_approx_string(s)
+
+
+def _date_precision_note(val: Any, label: str) -> str | None:
+    """Return a note preserving precision lost when a date is degraded.
+
+    e.g. "194?-02-28" has a known day and month but a decade-uncertain year,
+    so it is emitted as "BET 1940 AND 1949". The headline range hides that the
+    event was a 28 Feb; this note records it so nothing is silently lost.
+    """
+    if not isinstance(val, str):
+        return None
+    m = re.match(r"^(\d{3})\?-(\d{2})(?:-(\d{2}))?$", val.strip())
+    if not m:
+        return None
+    month = int(m.group(2))
+    if not 1 <= month <= 12:
+        return None
+    known = _MONTHS[month - 1]
+    if m.group(3):
+        known = f"{int(m.group(3))} {known}"
+    decade = int(m.group(1)) * 10
+    return (
+        f"{label} date recorded as \"{val.strip()}\": {known} is known, but "
+        f"the year is uncertain within the {decade}s."
+    )
 
 
 def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
@@ -242,11 +322,25 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
 
+    # Excel cell comments hold the genealogist's research notes (alternate
+    # spellings, birth-vs-christening clarifications, sources). They are not
+    # part of any cell's value, so gather them per row, ordered by column.
+    row_notes: dict[int, list[str]] = {}
+    for (nr, nc), note in sorted(ws.cell_note_map.items()):
+        text = (note.text or "").strip()
+        if text:
+            row_notes.setdefault(nr, []).append(text)
+
     # ------------------------------------------------------------------
     # Pass 1 – collect raw person and marriage rows
     # ------------------------------------------------------------------
     person_rows: list[dict] = []
     marriage_rows: list[dict] = []
+    # Given-name-only rows (no generation/code/surname/flag) list extra children
+    # under the family above them — e.g. Alexander Livingstone's daughters
+    # Stella and Maud. Captured with the base of the preceding coded row.
+    loose_child_rows: list[tuple[int, str, str | None]] = []
+    last_child_base: str | None = None
 
     for r in range(DATA_START_ROW, ws.nrows):
         flag = str(v(r, _C_FLAG)).strip()
@@ -254,11 +348,16 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
 
         if flag == "M":
             combined = str(v(r, _C_GIVEN)).strip()
+            marr_notes = list(row_notes.get(r, []))
+            mn = _date_precision_note(v(r, _C_DATE1), "Marriage")
+            if mn:
+                marr_notes.append(mn)
             marriage_rows.append({
                 "row": r,
                 "combined": combined,
                 "date": _parse_date(v(r, _C_DATE1)),
                 "place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
+                "cell_notes": marr_notes,
             })
         elif generation != "":
             surname = str(v(r, _C_SURNAME)).strip()
@@ -267,6 +366,12 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             # '|' is an occasional typo for the '/' child separator
             code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_base = _strip_nee(surname)
+
+            person_notes = list(row_notes.get(r, []))
+            for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death")):
+                pn = _date_precision_note(v(r, cell), lbl)
+                if pn:
+                    person_notes.append(pn)
 
             person_rows.append({
                 "row": r,
@@ -286,8 +391,18 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 "sex": _infer_sex(surname),
                 "occupation": str(v(r, _C_OCCUPATION)).strip() or None,
                 "notes": str(v(r, _C_NOTES)).strip() or None,
+                "cell_notes": person_notes,
                 "dedup_key": _dedup_key(given, surname_base, father, v(r, _C_DATE1)),
             })
+            last_child_base = _code_base(code)
+        else:
+            given = str(v(r, _C_GIVEN)).strip()
+            if (
+                given
+                and not str(v(r, _C_SURNAME)).strip()
+                and not str(v(r, _C_CODE)).strip()
+            ):
+                loose_child_rows.append((r, given, last_child_base))
 
     # ------------------------------------------------------------------
     # Pass 2 – deduplicate individuals
@@ -313,6 +428,9 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 existing.occupation = p["occupation"]
             if existing.sex is None and p["sex"]:
                 existing.sex = p["sex"]
+            for n in p["cell_notes"]:
+                if n not in existing.note_list:
+                    existing.note_list.append(n)
             return existing
         _id_counter += 1
         ind = Individual(
@@ -327,6 +445,7 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             sex=p["sex"],
             occupation=p["occupation"],
             notes=p["notes"],
+            note_list=list(p["cell_notes"]),
         )
         dedup_map[dk] = ind
         return ind
@@ -361,6 +480,9 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             dst.sex = src.sex
         if not dst.notes and src.notes:
             dst.notes = src.notes
+        for n in src.note_list:
+            if n not in dst.note_list:
+                dst.note_list.append(n)
 
     strong_canon: dict[tuple, Individual] = {}
     for dk, ind in list(dedup_map.items()):
@@ -392,6 +514,12 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     # Maps base code → the most recently opened Family with that base
     active_family: dict[str, Family] = {}
 
+    # Spouse-id → Individual, for matching marriage rows to families by name.
+    id_to_ind = {ind.id: ind for ind in dedup_map.values()}
+
+    def _marriage_tokens(combined: str) -> set[str]:
+        return set(re.findall(r"[a-z]+", combined.lower()))
+
     # Interleave person and marriage rows in row order
     all_events: list[tuple[int, str, dict]] = (
         [(p["row"], "person", p) for p in person_rows]
@@ -402,13 +530,24 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     for _, etype, data in all_events:
         if etype == "marriage":
             # Attach marriage info to the most recently opened family whose
-            # husband name appears in the combined string.
-            combined = data["combined"]
-            # Try to match by scanning active families (most recent first)
+            # husband or wife surname appears in the combined "X m. Y" string.
+            # The surname guard prevents a stray marriage row (e.g. from a
+            # note block whose people were never read as individuals) from
+            # corrupting an unrelated family that merely happens to lack a
+            # marriage date.
+            tokens = _marriage_tokens(data["combined"])
             for fam in reversed(families):
-                if fam.marriage_date is None:
+                if fam.marriage_date is not None:
+                    continue
+                h = id_to_ind.get(fam.husband_id)
+                w = id_to_ind.get(fam.wife_id)
+                h_sn = (h.surname or "").lower().strip() if h else ""
+                w_sn = (w.surname or "").lower().strip() if w else ""
+                if (h_sn and h_sn in tokens) or (w_sn and w_sn in tokens):
                     fam.marriage_date = data["date"]
                     fam.marriage_place = data["place"]
+                    fam.note_list.extend(data["cell_notes"])
+                    data["attached"] = True
                     break
             continue
 
@@ -465,6 +604,35 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             h = id_to_ind[fam.husband_id]
             if h.sex == "F":
                 fam.husband_id, fam.wife_id = fam.wife_id, fam.husband_id
+
+    # ------------------------------------------------------------------
+    # Pass 3.5 – loose given-name-only children
+    #
+    # Attach each bare given-name row to the family it sits under, taking the
+    # father's surname (their maiden/paternal name). Skip names that merely
+    # repeat an already-coded child (e.g. "Mabel" == "Mabel Annie", LivAx/Mb)
+    # to avoid duplicating that individual.
+    # ------------------------------------------------------------------
+    for row, given, ctx_base in loose_child_rows:
+        if not ctx_base:
+            continue
+        fam = active_family.get(ctx_base)
+        if fam is None:
+            continue
+        existing_givens = {
+            (id_to_ind[c].given_name or "").lower().split()[0]
+            for c in fam.child_ids
+            if c in id_to_ind and id_to_ind[c].given_name
+        }
+        if given.lower().split()[0] in existing_givens:
+            continue
+        father = id_to_ind.get(fam.husband_id)
+        surname = (father.surname if father else "") or ""
+        _id_counter += 1
+        child = Individual(id=f"I{_id_counter}", given_name=given, surname=surname)
+        dedup_map[("__loose__", row)] = child
+        id_to_ind[child.id] = child
+        fam.child_ids.append(child.id)
 
     # ------------------------------------------------------------------
     # Pass 4 – Synthetic parents for family-head rows
@@ -540,11 +708,197 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         parent_fams[pkey].child_ids.append(ind.id)
         already_child.add(ind.id)
 
+    # ------------------------------------------------------------------
+    # Pass 5 – flag-based event blocks
+    #
+    # Some ancestry is recorded not with generation numbers and codes but as
+    # free-standing B (birth) / D (death) / M (marriage) event rows — e.g. the
+    # Forster line behind Maud Ponting (née Forster), who is already in the
+    # main tree. Merge each person's B and D rows, recover birth/death/notes,
+    # and link them via the parent-name columns, reusing Pass-4 resolution so
+    # block people unify with the synthetic parents the main tree already
+    # implied (e.g. Maud's father "John Forster") instead of duplicating them.
+    # ------------------------------------------------------------------
+    def _parent_family(fid: str | None, mid: str | None) -> Family:
+        nonlocal _fam_counter
+        # Reuse a half-known couple (father-only or mother-only) rather than
+        # splitting a sibling group across two families.
+        for cand in ((fid, mid), (fid, None), (None, mid)):
+            if cand == (None, None):
+                continue
+            fam = parent_fams.get(cand)
+            if fam is not None:
+                if fid and fam.husband_id is None:
+                    fam.husband_id = fid
+                if mid and fam.wife_id is None:
+                    fam.wife_id = mid
+                parent_fams.pop(cand, None)
+                parent_fams[(fam.husband_id, fam.wife_id)] = fam
+                return fam
+        _fam_counter += 1
+        fam = Family(id=f"F{_fam_counter}", husband_id=fid, wife_id=mid)
+        families.append(fam)
+        parent_fams[(fid, mid)] = fam
+        return fam
+
+    block_people: dict[tuple, dict] = {}
+    block_order: list[tuple] = []
+    for r in range(DATA_START_ROW, ws.nrows):
+        if str(v(r, _C_FLAG)).strip() not in ("B", "D"):
+            continue
+        if v(r, _C_GENERATION) != "":
+            continue
+        surname = str(v(r, _C_SURNAME)).strip()
+        if not surname:
+            continue
+        flag = str(v(r, _C_FLAG)).strip()
+        # Strip clarifying annotations like "John {Maud's father}".
+        given = re.sub(r"\s*\{.*?\}", "", str(v(r, _C_GIVEN)).strip()).strip()
+        surname_base = _strip_nee(surname)
+        father_raw = str(v(r, _C_FATHER)).strip()
+        mother_raw = str(v(r, _C_MOTHER)).strip()
+        f_first = father_raw.split()[0].lower() if father_raw and father_raw != "?" else "?"
+        m_first = mother_raw.split()[0].lower() if mother_raw and mother_raw != "?" else "?"
+        # Parents distinguish same-named people (e.g. two different "John"s).
+        key = (surname_base.upper(), given.lower(), f_first, m_first)
+        rec = block_people.get(key)
+        if rec is None:
+            rec = {
+                "given": given, "surname_base": surname_base,
+                "father_raw": father_raw, "mother_raw": mother_raw,
+                "birth": None, "death": None, "death_place": None,
+                "sex": _infer_sex(surname), "notes": [],
+            }
+            block_people[key] = rec
+            block_order.append(key)
+        block_notes = list(row_notes.get(r, []))
+        pn = _date_precision_note(v(r, _C_DATE1), "Birth" if flag == "B" else "Death")
+        if pn:
+            block_notes.append(pn)
+        for n in block_notes:
+            if n not in rec["notes"]:
+                rec["notes"].append(n)
+        date = _parse_date(v(r, _C_DATE1))
+        if flag == "B":
+            rec["birth"] = rec["birth"] or date
+        else:
+            rec["death"] = rec["death"] or date
+            place = str(v(r, _C_TOWN)).strip()
+            if place and not rec["death_place"]:
+                rec["death_place"] = place
+
+    # Full-given-name index over every individual built so far, used to unify
+    # a block person with the record the main tree already implied (e.g. Maud,
+    # or her father "John Forster"). Keyed on the *whole* given name so
+    # "John T." stays distinct from "John".
+    def _full_key(given: str | None, surname: str | None) -> tuple[str, str]:
+        return ((surname or "").upper(), (given or "").lower().split("(")[0].strip())
+
+    full_index: dict[tuple[str, str], Individual] = {}
+    for ind in list(dedup_map.values()) + list(synth_by_name.values()):
+        full_index.setdefault(_full_key(ind.given_name, ind.surname), ind)
+
+    # Materialise each block person, unifying with existing/synthetic records.
+    # Same full name + different parents (e.g. John Forster the father vs John
+    # Forster the infant brother) must stay distinct: only the first occurrence
+    # of a given name unifies with a pre-existing record; later ones are new.
+    block_created: list[Individual] = []
+    block_fullname_seen: set[tuple[str, str]] = set()
+    for key in block_order:
+        rec = block_people[key]
+        nk = _ind_name_key(rec["given"], rec["surname_base"])
+        fk = _full_key(rec["given"], rec["surname_base"])
+        ind = None if fk in block_fullname_seen else full_index.get(fk)
+        block_fullname_seen.add(fk)
+        if ind is None:
+            _id_counter += 1
+            ind = Individual(
+                id=f"I{_id_counter}", given_name=rec["given"],
+                surname=rec["surname_base"], sex=rec["sex"],
+            )
+            block_created.append(ind)
+        # Pin the loose name keys to the first (primary) holder so a later
+        # same-named block person can't redirect parent lookups to itself.
+        synth_by_name.setdefault(nk, ind)
+        existing_by_name.setdefault(nk, ind)
+        full_index.setdefault(fk, ind)
+        if not ind.birth_date and rec["birth"]:
+            ind.birth_date = rec["birth"]
+        if not ind.death_date and rec["death"]:
+            ind.death_date = rec["death"]
+        if not ind.death_place and rec["death_place"]:
+            ind.death_place = rec["death_place"]
+        if ind.sex is None and rec["sex"]:
+            ind.sex = rec["sex"]
+        for n in rec["notes"]:
+            if n not in ind.note_list:
+                ind.note_list.append(n)
+        rec["ind"] = ind
+        # Married women are referenced as a mother by given name only; register
+        # a given-name alias so those parent lookups unify with this record.
+        if rec["sex"] == "F" and nk[1]:
+            synth_by_name.setdefault(("", nk[1]), ind)
+
+    # Link block people to their parents.
+    for key in block_order:
+        rec = block_people[key]
+        ind = rec["ind"]
+        if ind.id in already_child:
+            continue
+        fp = _parse_parent_name(rec["father_raw"])
+        mp = _parse_parent_name(rec["mother_raw"])
+        if fp is None and mp is None:
+            continue
+        father_ind = _resolve_parent(fp, "M")
+        mother_ind = _resolve_parent(mp, "F")
+        if father_ind is None and mother_ind is None:
+            continue
+        fam = _parent_family(
+            father_ind.id if father_ind else None,
+            mother_ind.id if mother_ind else None,
+        )
+        fam.child_ids.append(ind.id)
+        already_child.add(ind.id)
+
+    # Attach the block's marriage rows (skipped by Pass 3 as no family existed
+    # for them then) to the now-built couples, matching both spouses by name.
+    all_ind_by_id = {
+        i.id: i for i in list(dedup_map.values()) + list(synth_by_name.values())
+    }
+
+    def _spouse_matches(ind: Individual | None, tokens: set[str]) -> bool:
+        if ind is None:
+            return False
+        g = (ind.given_name or "").lower().split("(")[0].split()
+        s = (ind.surname or "").lower().strip()
+        first = g[0] if g else ""
+        if s and s not in tokens:
+            return False
+        if first and first not in tokens:
+            return False
+        return bool(s or first)
+
+    for m in marriage_rows:
+        if m.get("attached") or (m["date"] is None and m["place"] is None):
+            continue
+        tokens = set(re.findall(r"[a-z]+", m["combined"].lower()))
+        for fam in families:
+            if fam.marriage_date is not None:
+                continue
+            h = all_ind_by_id.get(fam.husband_id)
+            w = all_ind_by_id.get(fam.wife_id)
+            if h and w and _spouse_matches(h, tokens) and _spouse_matches(w, tokens):
+                fam.marriage_date = m["date"]
+                fam.marriage_place = m["place"]
+                fam.note_list.extend(m["cell_notes"])
+                m["attached"] = True
+                break
+
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.
     seen_ids: set[str] = set()
     ordered: list[Individual] = []
-    for ind in list(dedup_map.values()) + list(synth_by_name.values()):
+    for ind in list(dedup_map.values()) + list(synth_by_name.values()) + block_created:
         if ind.id not in seen_ids:
             seen_ids.add(ind.id)
             ordered.append(ind)

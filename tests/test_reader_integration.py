@@ -58,6 +58,97 @@ def test_child_parent_chain_is_linked(parsed):
     assert father is not None and father.given_name.startswith("Clive")
 
 
+def test_loose_given_name_children_recovered(parsed):
+    individuals, families = parsed
+
+    def find(given):
+        return [
+            i for i in individuals
+            if i.given_name == given and (i.surname or "").upper() == "LIVINGSTONE"
+        ]
+
+    # Stella and Maud were listed only as bare given names; recovered as
+    # children of Alexander Livingstone.
+    stella = find("Stella")
+    maud = find("Maud")
+    assert len(stella) == 1 and len(maud) == 1
+
+    # "Mabel" merely repeats the coded "Mabel Annie" (LivAx/Mb) and must not
+    # become a second individual.
+    assert not find("Mabel")
+    assert find("Mabel Annie")
+
+    alex = next(
+        i for i in individuals
+        if i.surname == "LIVINGSTONE" and i.given_name == "Alexander"
+    )
+    fam = next(f for f in families if stella[0].id in f.child_ids)
+    assert fam.husband_id == alex.id
+
+
+def test_cell_comments_become_notes(parsed):
+    individuals, _ = parsed
+    # The genealogist's research lived in Excel cell comments, not cell values.
+    # Robert Belshaw's note about Wigan must survive onto his record.
+    roberts = [
+        i for i in individuals
+        if (i.surname or "").upper() == "BELSHAW" and i.given_name.startswith("Robert")
+    ]
+    assert any("Wigan" in n for i in roberts for n in i.note_list)
+
+
+def test_flag_based_forster_block_is_recovered(parsed):
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    # Maud links to her father's family, recovered from B/D event rows.
+    maud = next(
+        i for i in individuals
+        if i.surname == "PONTING" and i.given_name == "Maud"
+    )
+    fam = next(
+        f for f in families
+        if maud.id in f.child_ids
+        and f.husband_id
+        and by_id[f.husband_id].given_name == "John"
+        and (by_id[f.husband_id].surname or "").upper() == "FORSTER"
+    )
+    john = by_id[fam.husband_id]
+    assert john.birth_date and john.death_date  # b ABT 1829, d 1901
+
+    # Maud's mother Ellen is filled into the same family.
+    assert fam.wife_id and by_id[fam.wife_id].given_name.startswith("Ellen")
+    # Edward and Samuel are Maud's siblings in that same family.
+    sib_names = {by_id[c].given_name for c in fam.child_ids}
+    assert {"Edward", "Samuel"} <= sib_names
+
+    # John T. (James's son by his second wife Bridget) is a *distinct* person,
+    # not collapsed into John despite the shared first name.
+    john_t = next(
+        i for i in individuals
+        if (i.surname or "").upper() == "FORSTER" and i.given_name == "John T."
+    )
+    assert john_t.id != john.id
+
+
+def test_marriage_not_misattributed_to_unrelated_family(parsed):
+    individuals, families = parsed
+    # Allan & Adrienne Steele have no marriage row in the source. A stray
+    # marriage row from the un-coded Forster note block (e.g. "James Forster
+    # -m- Margaret", 1828) must not leak its date onto an unrelated family.
+    allan = _find(individuals, "Allan Richard Paul")[0]
+    fam = next(f for f in families if allan.id in (f.husband_id, f.wife_id))
+    assert fam.marriage_date is None
+
+    # Every family that does carry a marriage date must have a spouse whose
+    # surname plausibly belongs to that marriage (no orphaned Forster dates).
+    by_id = {i.id: i for i in individuals}
+    for f in families:
+        if f.marriage_date:
+            spouses = [by_id.get(f.husband_id), by_id.get(f.wife_id)]
+            assert any(s and s.surname for s in spouses)
+
+
 def test_bridging_person_is_deduplicated(parsed):
     individuals, families = parsed
     adriennes = _find(individuals, "Adrienne Lois")

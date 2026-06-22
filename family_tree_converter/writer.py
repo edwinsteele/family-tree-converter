@@ -1,9 +1,36 @@
 """Write GEDCOM 5.5.1 output from parsed individuals and families."""
 
+import re
 from collections import defaultdict
 from pathlib import Path
 
 from .reader import Family, Individual
+
+# GEDCOM 5.5.1 limits a physical line to 255 chars. Wrap note payloads well
+# under that (accounting for the level/tag prefix and any multi-byte chars).
+_NOTE_WRAP = 200
+
+
+def _note_lines(text: str) -> list[str]:
+    """Serialise one note as GEDCOM NOTE/CONC/CONT lines.
+
+    Embedded line breaks become CONT; overlong logical lines are split with
+    CONC so no physical line exceeds the GEDCOM length limit.
+    """
+    out: list[str] = []
+    logical_lines = re.split(r"\r\n|\r|\n", text)
+    for li, logical in enumerate(logical_lines):
+        tag = "NOTE" if li == 0 else "CONT"
+        level = "1" if li == 0 else "2"
+        if logical == "":
+            out.append(f"{level} {tag}")
+            continue
+        chunk, rest = logical[:_NOTE_WRAP], logical[_NOTE_WRAP:]
+        out.append(f"{level} {tag} {chunk}")
+        while rest:
+            out.append(f"2 CONC {rest[:_NOTE_WRAP]}")
+            rest = rest[_NOTE_WRAP:]
+    return out
 
 _HEADER = """\
 0 HEAD
@@ -59,7 +86,9 @@ def write_gedcom(
         if ind.occupation:
             lines.append(f"1 OCCU {ind.occupation}")
         if ind.notes:
-            lines.append(f"1 NOTE {ind.notes}")
+            lines.extend(_note_lines(ind.notes))
+        for note in ind.note_list:
+            lines.extend(_note_lines(note))
 
         for fam_id in fams.get(ind.id, []):
             lines.append(f"1 FAMS @{fam_id}@")
@@ -80,6 +109,8 @@ def write_gedcom(
                 lines.append(f"2 PLAC {fam.marriage_place}")
         for child_id in fam.child_ids:
             lines.append(f"1 CHIL @{child_id}@")
+        for note in fam.note_list:
+            lines.extend(_note_lines(note))
 
     lines.append(_TRAILER)
     output_path.write_text("\n".join(lines), encoding="utf-8")
