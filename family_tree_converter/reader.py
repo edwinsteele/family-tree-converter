@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,6 +101,12 @@ def _parse_approx_string(s: str) -> str | None:
         # bare "1900s"
         return f"BET {base} AND {base + 9}"
 
+    # "1930/1", "1831/2" → uncertain year, convert to BET range
+    m = re.match(r"^(\d{4})/\d{1,2}$", s.strip())
+    if m:
+        year = int(m.group(1))
+        return f"BET {year} AND {year + 1}"
+
     return s  # pass through unchanged; writer will emit as-is
 
 
@@ -114,6 +121,10 @@ def _parse_date(val: Any) -> str | None:
         month = remainder // 100
         day = remainder % 100
         if year < 1000:
+            if date_int > 2200:
+                # Excel date serial (e.g. 24166 → 28 FEB 1966)
+                d = datetime.date(1899, 12, 30) + datetime.timedelta(days=date_int)
+                return f"{d.day} {_MONTHS[d.month - 1]} {d.year}"
             # Year-only stored as plain integer (e.g. 1760.0)
             return str(date_int)
         if 1 <= month <= 12:

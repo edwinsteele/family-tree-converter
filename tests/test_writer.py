@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from family_tree_converter.reader import Family, Individual, _parse_approx_string
+from family_tree_converter.reader import Family, Individual, _parse_approx_string, _parse_date
 from family_tree_converter.writer import write_gedcom
 
 
@@ -35,6 +35,9 @@ def sample_family(sample_individual):
 
 
 @pytest.mark.parametrize("raw, expected", [
+    ("1930/1",         "BET 1930 AND 1931"),
+    ("1831/2",         "BET 1831 AND 1832"),
+    ("1862/3",         "BET 1862 AND 1863"),
     ("approx.1886",    "ABT 1886"),
     ("approx.1893",    "ABT 1893"),
     ("v.approx.1945",  "ABT 1945"),
@@ -49,6 +52,14 @@ def sample_family(sample_individual):
 ])
 def test_parse_approx_string(raw, expected):
     assert _parse_approx_string(raw) == expected
+
+
+def test_parse_date_excel_serial():
+    assert _parse_date(24166.0) == "28 FEB 1966"
+
+
+def test_parse_date_year_only_not_confused_with_serial():
+    assert _parse_date(1760.0) == "1760"
 
 
 def test_write_gedcom_produces_valid_structure(sample_family, tmp_path):
