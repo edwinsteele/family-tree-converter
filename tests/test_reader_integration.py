@@ -133,12 +133,15 @@ def test_flag_based_forster_block_is_recovered(parsed):
 
 def test_marriage_not_misattributed_to_unrelated_family(parsed):
     individuals, families = parsed
-    # Allan & Adrienne Steele have no marriage row in the source. A stray
+    # Allan & Adrienne Steele's marriage is recorded only on their own rows
+    # (cols 31/32: 11 Mar 1967, Sutherland), not as an 'M'-flag row. A stray
     # marriage row from the un-coded Forster note block (e.g. "James Forster
-    # -m- Margaret", 1828) must not leak its date onto an unrelated family.
+    # -m- Margaret", 1828) must not leak its date onto this family: the date
+    # must be the couple's own, never the bogus 1828 Forster one.
     allan = _find(individuals, "Allan Richard Paul")[0]
     fam = next(f for f in families if allan.id in (f.husband_id, f.wife_id))
-    assert fam.marriage_date is None
+    assert fam.marriage_date == "11 MAR 1967"
+    assert fam.marriage_place == "Sutherland, Sydney"
 
     # Every family that does carry a marriage date must have a spouse whose
     # surname plausibly belongs to that marriage (no orphaned Forster dates).
@@ -271,3 +274,80 @@ def test_bridging_person_is_deduplicated(parsed):
     }
     assert "BELSHAW" in parent_surnames
     assert "GREEN" in parent_surnames
+
+
+def test_marriage_read_from_spouse_rows(parsed):
+    """Most couples record their marriage on the spouses' own rows (cols 31/32),
+    not as an 'M'-flag row. Those must be recovered, not dropped."""
+    individuals, families = parsed
+    with_marriage = [f for f in families if f.marriage_date or f.marriage_place]
+    # Far more than the ~20 'M'-flag rows would yield on their own.
+    assert len(with_marriage) >= 80
+
+    # Daniel Livingstone × Isobel married 9 Apr 1786 at Barony — recorded only
+    # on their individual rows.
+    daniel = _one(individuals, "Daniel", "LIVINGSTONE")
+    fam = next(
+        f for f in families
+        if daniel.id in (f.husband_id, f.wife_id) and f.marriage_date
+    )
+    assert fam.marriage_date == "9 APR 1786"
+    assert fam.marriage_place and "Barony" in fam.marriage_place
+
+
+def test_shared_base_code_marriages_stay_distinct(parsed):
+    """Two different people sharing a base-code prefix (e.g. an elder and a
+    younger Thomas Ponting) must each keep their *own* col-31 marriage date,
+    not have one leak onto the other. This is why attachment is keyed on the
+    individual spouse, not on the family base code."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    thomases = [
+        i for i in individuals
+        if i.given_name.startswith("Thomas") and (i.surname or "") == "PONTING"
+    ]
+    dated = {}
+    for t in thomases:
+        for f in families:
+            if t.id in (f.husband_id, f.wife_id) and f.marriage_date:
+                dated[t.id] = (f.marriage_date, by_id.get(f.wife_id))
+    # At least two distinct Thomas Pontings, each with a different marriage date.
+    distinct_dates = {d for d, _ in dated.values()}
+    assert len(distinct_dates) >= 2, dated
+
+
+def test_sex_assigned_from_family_role(parsed):
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    # Every spouse must carry a sex. Role fills the gap left when no "née"
+    # surname was present, without overriding an explicit inference: wives are
+    # always F; husbands are M unless the slot holds a née-female lineage
+    # connector whose own spouse is absent (then no swap could fire).
+    for f in families:
+        if f.husband_id:
+            h = by_id[f.husband_id]
+            assert h.sex is not None, f.husband_id
+            assert h.sex == "M" or (h.sex == "F" and f.wife_id is None)
+        if f.wife_id:
+            assert by_id[f.wife_id].sex == "F", f.wife_id
+
+    # A previously sexless male family head (James Hunter, no "née") is now M.
+    james = _one(individuals, "James", "HUNTER")
+    assert james.sex == "M"
+
+
+def test_remarried_woman_filed_under_maiden_name(parsed):
+    individuals, _ = parsed
+    # "PONTING then PETTY [née Richey]" → surname Richey, married names noted.
+    louisa = _one(individuals, "Louisa Georgina", "RICHEY")
+    assert louisa.married_surnames == ["PONTING", "PETTY"]
+    assert any("PONTING, then PETTY" in n for n in louisa.note_list)
+    # The compound married string must never become the surname.
+    assert not any(" then " in (i.surname or "").lower() for i in individuals)
+
+
+def test_lineage_membership_noted(parsed):
+    individuals, _ = parsed
+    daniel = _one(individuals, "Daniel", "LIVINGSTONE")
+    assert "Livingstone" in daniel.lineage_lines
+    assert any(n.startswith("Family lines:") for n in daniel.note_list)

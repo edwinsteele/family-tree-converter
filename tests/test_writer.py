@@ -10,6 +10,8 @@ from family_tree_converter.reader import (
     _code_base,
     _code_role,
     _code_self,
+    _maiden_name,
+    _married_surnames,
     _parse_approx_string,
     _parse_date,
 )
@@ -85,6 +87,41 @@ def test_parse_approx_string(raw, expected):
 
 def test_parse_date_excel_serial():
     assert _parse_date(24166.0) == "28 FEB 1966"
+
+
+@pytest.mark.parametrize("surname, maiden", [
+    ("LIVINGSTONE [née Hunter]", "Hunter"),
+    ("PONTING then PETTY [née Richey]", "Richey"),
+    ("STEELE [née Belshaw/Green]", "Belshaw/Green"),
+    ("CLOAK [née  ? ]", None),       # maiden unknown
+    ("HUNTER", None),                # no née clause
+])
+def test_maiden_name(surname, maiden):
+    assert _maiden_name(surname) == maiden
+
+
+@pytest.mark.parametrize("base, parts", [
+    ("PONTING then PETTY", ["PONTING", "PETTY"]),
+    ("JOB then TAYLOR", ["JOB", "TAYLOR"]),
+    ("PONTING", ["PONTING"]),        # single surname → one element
+    ("", []),
+])
+def test_married_surnames(base, parts):
+    assert _married_surnames(base) == parts
+
+
+def test_marriage_from_spouse_row_emitted(tmp_path):
+    """A marriage recorded on spouse rows (no 'M'-flag) must reach the GEDCOM."""
+    husband = Individual(id="I1", given_name="Daniel", surname="LIVINGSTONE", sex="M")
+    wife = Individual(id="I2", given_name="Isobel", surname="LIVINGSTONE", sex="F")
+    fam = Family(id="F1", husband_id="I1", wife_id="I2",
+                 marriage_date="9 APR 1786", marriage_place="Barony, Scotland")
+    out = tmp_path / "t.ged"
+    write_gedcom([husband, wife], [fam], out)
+    text = out.read_text()
+    assert "1 MARR" in text
+    assert "2 DATE 9 APR 1786" in text
+    assert "2 PLAC Barony, Scotland" in text
 
 
 def test_parse_date_year_only_not_confused_with_serial():

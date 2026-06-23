@@ -24,8 +24,12 @@ _C_TOWN = 22
 _C_COUNTY = 23
 _C_DEATH_DATE = 24
 _C_BURIED = 25
+_C_MARRIAGE = 31       # marriage date on an individual (spouse) row
+_C_MARRIED_PLACE = 32  # where married, on an individual (spouse) row
 _C_OCCUPATION = 33
 _C_NOTES = 34
+_C_LINE_FIRST = 38     # first of the principal-lineage membership columns
+_C_LINE_LAST = 42      # last of the principal-lineage membership columns
 
 DATA_START_ROW = 17
 
@@ -58,6 +62,10 @@ class Individual:
     notes: str | None = None
     # Free-text annotations harvested from Excel cell comments.
     note_list: list[str] = field(default_factory=list)
+    # Principal lineage charts this person belongs to (e.g. {"Belshaw"}).
+    lineage_lines: set[str] = field(default_factory=set)
+    # Successive married surnames for a woman recorded as "X then Y".
+    married_surnames: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -258,6 +266,30 @@ def _strip_nee(surname: str) -> str:
     return re.sub(r"\s*\[.*?\]", "", surname).strip()
 
 
+def _maiden_name(surname: str) -> str | None:
+    """Extract the maiden surname from 'MARRIED [née Maiden]'.
+
+    Returns None when no née clause is present or the maiden name is unknown
+    ('[née  ? ]').
+    """
+    m = re.search(r"\[\s*n[ée]e\s+(.*?)\s*\]", surname, re.IGNORECASE)
+    if not m:
+        return None
+    val = " ".join(m.group(1).split())
+    if not val or val == "?":
+        return None
+    return val
+
+
+def _married_surnames(surname_base: str) -> list[str]:
+    """Split a 'PONTING then PETTY' progression into ['PONTING', 'PETTY'].
+
+    A single surname returns a one-element list.
+    """
+    parts = [p.strip() for p in re.split(r"\s+then\s+", surname_base, flags=re.IGNORECASE)]
+    return [p for p in parts if p]
+
+
 def _infer_sex(surname: str) -> str | None:
     if "née" in surname:
         return "F"
@@ -366,6 +398,25 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         if text:
             row_notes.setdefault(nr, []).append(text)
 
+    # The header legend (rows above the data) maps the single-letter lineage
+    # codes in cols 38-42 to the principal family-line surnames, e.g.
+    # "B=Belshaw", "L=Livingstone". Build that lookup so per-person membership
+    # codes can be rendered as readable names.
+    line_map: dict[str, str] = {}
+    for r in range(0, DATA_START_ROW):
+        for c in range(_C_LINE_FIRST, ws.ncols):
+            m = re.match(r"^([A-Za-z]{1,2})\s*=\s*(.+)$", str(v(r, c)).strip())
+            if m:
+                line_map.setdefault(m.group(1), m.group(2).strip())
+
+    def _lines_for(r: int) -> set[str]:
+        names: set[str] = set()
+        for c in range(_C_LINE_FIRST, ws.ncols):
+            code = str(v(r, c)).strip()
+            if code:
+                names.add(line_map.get(code, code))
+        return names
+
     # ------------------------------------------------------------------
     # Pass 1 – collect raw person and marriage rows
     # ------------------------------------------------------------------
@@ -403,7 +454,8 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             surname_base = _strip_nee(surname)
 
             person_notes = list(row_notes.get(r, []))
-            for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death")):
+            for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death"),
+                              (_C_MARRIAGE, "Marriage")):
                 pn = _date_precision_note(v(r, cell), lbl)
                 if pn:
                     person_notes.append(pn)
@@ -417,16 +469,22 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 "mother_raw": str(v(r, _C_MOTHER)).strip(),
                 "surname": surname,
                 "surname_base": surname_base,
+                "maiden": _maiden_name(surname),
                 "given": given,
                 "birth_date": _parse_date(v(r, _C_DATE1)),
                 "birth_is_chr": flag == "C",
                 "birth_place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
                 "death_date": _parse_date(v(r, _C_DEATH_DATE)),
                 "death_place": str(v(r, _C_BURIED)).strip() or None,
+                # Marriage date/place are recorded on each spouse's own row
+                # (cols 31/32), not only on the rarer 'M'-flag rows.
+                "marr_date": _parse_date(v(r, _C_MARRIAGE)),
+                "marr_place": str(v(r, _C_MARRIED_PLACE)).strip() or None,
                 "sex": _infer_sex(surname),
                 "occupation": str(v(r, _C_OCCUPATION)).strip() or None,
                 "notes": str(v(r, _C_NOTES)).strip() or None,
                 "cell_notes": person_notes,
+                "lines": _lines_for(r),
                 "dedup_key": _dedup_key(given, surname_base, father, v(r, _C_DATE1)),
             })
             last_child_base = _code_base(code)
@@ -466,12 +524,24 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             for n in p["cell_notes"]:
                 if n not in existing.note_list:
                     existing.note_list.append(n)
+            existing.lineage_lines |= p["lines"]
             return existing
         _id_counter += 1
+        # A woman recorded as "PONTING then PETTY [née Richey]" carries two
+        # successive married surnames in one cell. Genealogically she is filed
+        # under her maiden (birth) surname — which also matches her position in
+        # her own family's chart — with the married names preserved separately.
+        married = _married_surnames(p["surname_base"])
+        if len(married) > 1 and p["maiden"]:
+            display_surname = p["maiden"]
+            married_surnames = married
+        else:
+            display_surname = p["surname_base"]
+            married_surnames = []
         ind = Individual(
             id=f"I{_id_counter}",
             given_name=p["given"],
-            surname=p["surname_base"],
+            surname=display_surname,
             birth_date=p["birth_date"],
             birth_place=p["birth_place"],
             birth_is_christening=p["birth_is_chr"],
@@ -481,6 +551,8 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             occupation=p["occupation"],
             notes=p["notes"],
             note_list=list(p["cell_notes"]),
+            lineage_lines=set(p["lines"]),
+            married_surnames=married_surnames,
         )
         dedup_map[dk] = ind
         return ind
@@ -694,6 +766,29 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             h = id_to_ind[fam.husband_id]
             if h.sex == "F":
                 fam.husband_id, fam.wife_id = fam.wife_id, fam.husband_id
+
+    # Attach marriage date/place recorded on the spouses' own rows (cols 31/32).
+    # The 'M'-flag marriage rows cover only a fraction of couples; the rest
+    # carry their marriage details on each individual's row. Index by spouse id
+    # and fill any family still lacking a marriage. Keying on the husband's row
+    # keeps remarriages distinct (each husband row belongs to one family); the
+    # wife's row is a fallback when the husband has no recorded date.
+    row_marr: dict[str, dict] = {}
+    for p in person_rows:
+        if p["role"] not in ("husband", "wife"):
+            continue
+        if not (p["marr_date"] or p["marr_place"]):
+            continue
+        row_marr.setdefault(dedup_map[p["dedup_key"]].id, p)
+    for fam in families:
+        if fam.marriage_date or fam.marriage_place:
+            continue
+        for sid in (fam.husband_id, fam.wife_id):
+            src = row_marr.get(sid)
+            if src is not None:
+                fam.marriage_date = src["marr_date"]
+                fam.marriage_place = src["marr_place"]
+                break
 
     # ------------------------------------------------------------------
     # Pass 3.5 – loose given-name-only children
@@ -1019,4 +1114,30 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         if ind.id not in seen_ids:
             seen_ids.add(ind.id)
             ordered.append(ind)
+
+    # A person's role in a family establishes their sex: the husband is male,
+    # the wife female. Previously sex was only inferred from a "née" surname,
+    # leaving every family-head husband with no SEX. Fill the gap across all
+    # families (Pass 3 plus the synthetic/block parents from Passes 4-5),
+    # without overriding an explicit inference.
+    final_by_id = {ind.id: ind for ind in ordered}
+    for fam in families:
+        h = final_by_id.get(fam.husband_id)
+        if h is not None and h.sex is None:
+            h.sex = "M"
+        w = final_by_id.get(fam.wife_id)
+        if w is not None and w.sex is None:
+            w.sex = "F"
+
+    # Emit the accumulated lineage membership and married-surname progression
+    # as notes once per person (after all merges have unioned the data), so a
+    # person appearing in several charts gets a single combined note.
+    for ind in ordered:
+        if ind.married_surnames:
+            ind.note_list.insert(
+                0, "Married surname" + ("s" if len(ind.married_surnames) > 1 else "")
+                + ": " + ", then ".join(ind.married_surnames) + ".")
+        if ind.lineage_lines:
+            ind.note_list.append(
+                "Family lines: " + ", ".join(sorted(ind.lineage_lines)) + ".")
     return ordered, families
