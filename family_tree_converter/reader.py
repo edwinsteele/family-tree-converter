@@ -288,9 +288,55 @@ def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
     return (" ".join(parts[:-1]) or None, parts[-1])
 
 
+# Abbreviation expansions for place names. Modern genealogy apps (e.g.
+# MacFamilyTree) geocode and group by place, which works far better on full
+# names. Matched only against a whole comma-separated segment (after stripping
+# dots/spaces and lower-casing), so they can never substring-corrupt a real
+# town name. The source uses these dotted forms consistently.
+_PLACE_SEGMENT = {
+    "nsw": "New South Wales", "vic": "Victoria", "qld": "Queensland",
+    "wa": "Western Australia", "sa": "South Australia",
+    "nt": "Northern Territory", "act": "Australian Capital Territory",
+    "tas": "Tasmania", "syd": "Sydney", "irl": "Ireland", "eng": "England",
+    "scot": "Scotland", "nz": "New Zealand", "png": "Papua New Guinea",
+}
+# Whole-word expansions applied within a segment.
+_PLACE_WORD = {"nth": "North", "sth": "South", "jnct": "Junction"}
+
+
+def _standardise_place(place: str | None) -> str | None:
+    """Expand unambiguous abbreviations and tidy spacing in a place string.
+
+    'Sydney, N.S.W.' → 'Sydney, New South Wales'; 'Nth. Carlton' → 'North
+    Carlton'; 'St Peters' → 'Saint Peters'. Street names ('Flinders Street')
+    are already spelled out in full in the source, so 'St' is only ever Saint.
+    """
+    if not place:
+        return place
+    out: list[str] = []
+    for seg in place.split(","):
+        seg = seg.strip()
+        key = seg.lower().replace(".", "").replace(" ", "")
+        if key in _PLACE_SEGMENT:
+            out.append(_PLACE_SEGMENT[key])
+            continue
+        words = seg.split()
+        rebuilt = []
+        for wi, w in enumerate(words):
+            wkey = w.lower().rstrip(".")
+            if wi == 0 and wkey == "st":
+                rebuilt.append("Saint")
+            elif wkey in _PLACE_WORD:
+                rebuilt.append(_PLACE_WORD[wkey])
+            else:
+                rebuilt.append(w)
+        out.append(" ".join(rebuilt))
+    return ", ".join(s for s in out if s) or None
+
+
 def _build_place(*parts: str) -> str | None:
     cleaned = [p.strip() for p in parts if str(p).strip() and str(p).strip() != "?"]
-    return ", ".join(cleaned) or None
+    return _standardise_place(", ".join(cleaned)) or None
 
 
 def _strip_nee(surname: str) -> str:
@@ -551,11 +597,11 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 "birth_is_chr": flag == "C",
                 "birth_place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
                 "death_date": _parse_date(v(r, _C_DEATH_DATE)),
-                "death_place": str(v(r, _C_BURIED)).strip() or None,
+                "death_place": _standardise_place(str(v(r, _C_BURIED)).strip()) or None,
                 # Marriage date/place are recorded on each spouse's own row
                 # (cols 31/32), not only on the rarer 'M'-flag rows.
                 "marr_date": _parse_date(v(r, _C_MARRIAGE)),
-                "marr_place": str(v(r, _C_MARRIED_PLACE)).strip() or None,
+                "marr_place": _standardise_place(str(v(r, _C_MARRIED_PLACE)).strip()) or None,
                 "sex": _infer_sex(surname),
                 "occupation": str(v(r, _C_OCCUPATION)).strip() or None,
                 "notes": str(v(r, _C_NOTES)).strip() or None,
@@ -1107,7 +1153,7 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             rec["birth"] = rec["birth"] or date
         else:
             rec["death"] = rec["death"] or date
-            place = str(v(r, _C_TOWN)).strip()
+            place = _standardise_place(str(v(r, _C_TOWN)).strip())
             if place and not rec["death_place"]:
                 rec["death_place"] = place
 

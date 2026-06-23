@@ -54,6 +54,28 @@ def test_partner_code_for_prior_marriage_chain():
     assert _partner_code("GreJeAds-Ada-EmGe") == "GreJeAds-Ada"
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("Sydney, N.S.W.", "Sydney, New South Wales"),
+    ("Herston, Brisbane, QLD", "Herston, Brisbane, Queensland"),
+    ("Creswick, VIC.", "Creswick, Victoria"),
+    ("Canberra, A.C.T.", "Canberra, Australian Capital Territory"),
+    ("Perth, W.A.", "Perth, Western Australia"),
+    ("Flinders Street, Syd.", "Flinders Street, Sydney"),
+    ("County Down, IRL.", "County Down, Ireland"),
+    ("Nth. Carlton, Melbourne", "North Carlton, Melbourne"),
+    ("Maroubra Jnct., Syd.", "Maroubra Junction, Sydney"),
+    ("St Peters, Sydney, N.S.W.", "Saint Peters, Sydney, New South Wales"),
+    ("Blacktown , Sydney, N.S.W.", "Blacktown, Sydney, New South Wales"),
+    # A full street name must NOT be touched, and uncertainty markers survive.
+    ("Flinders Street", "Flinders Street"),
+    ("Africa (?)", "Africa (?)"),
+    (None, None),
+])
+def test_standardise_place(raw, expected):
+    from family_tree_converter.reader import _standardise_place
+    assert _standardise_place(raw) == expected
+
+
 @pytest.fixture
 def sample_individual():
     return Individual(
