@@ -124,6 +124,23 @@ def test_marriage_from_spouse_row_emitted(tmp_path):
     assert "2 PLAC Barony, Scotland" in text
 
 
+def test_lineage_lines_emitted_as_group_tags(tmp_path):
+    """Lineage-chart membership is written as custom _GROUP tags, one per line,
+    in sorted order — not as a freeform NOTE."""
+    ind = Individual(
+        id="I1", given_name="Daniel", surname="LIVINGSTONE", sex="M",
+        lineage_lines={"Williams", "Livingstone"},
+    )
+    out = tmp_path / "t.ged"
+    write_gedcom([ind], [], out)
+    text = out.read_text()
+    assert "1 _GROUP Livingstone" in text
+    assert "1 _GROUP Williams" in text
+    # Sorted: Livingstone precedes Williams.
+    assert text.index("_GROUP Livingstone") < text.index("_GROUP Williams")
+    assert "Family lines:" not in text
+
+
 def test_parse_date_year_only_not_confused_with_serial():
     assert _parse_date(1760.0) == "1760"
 

@@ -67,6 +67,12 @@ def write_gedcom(
         if ind.sex:
             lines.append(f"1 SEX {ind.sex}")
 
+        # Principal-lineage chart membership as a custom (underscore) tag, the
+        # GEDCOM convention for non-standard data: filterable, preserved by
+        # tolerant importers, safely ignored by strict ones.
+        for line_name in sorted(ind.lineage_lines):
+            lines.append(f"1 _GROUP {line_name}")
+
         if ind.birth_date or ind.birth_place:
             tag = "CHR" if ind.birth_is_christening else "BIRT"
             lines.append(f"1 {tag}")

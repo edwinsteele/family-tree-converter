@@ -346,8 +346,15 @@ def test_remarried_woman_filed_under_maiden_name(parsed):
     assert not any(" then " in (i.surname or "").lower() for i in individuals)
 
 
-def test_lineage_membership_noted(parsed):
+def test_lineage_membership_recorded(parsed):
     individuals, _ = parsed
     daniel = _one(individuals, "Daniel", "LIVINGSTONE")
     assert "Livingstone" in daniel.lineage_lines
-    assert any(n.startswith("Family lines:") for n in daniel.note_list)
+    # Lineage membership is written as a custom _GROUP tag by the writer, not
+    # as a repetitive freeform note. No "Family lines:" note should remain.
+    assert not any(n.startswith("Family lines:") for n in daniel.note_list)
+    assert not any(
+        n.startswith("Family lines:")
+        for i in individuals
+        for n in i.note_list
+    )

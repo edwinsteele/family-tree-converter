@@ -1129,15 +1129,13 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         if w is not None and w.sex is None:
             w.sex = "F"
 
-    # Emit the accumulated lineage membership and married-surname progression
-    # as notes once per person (after all merges have unioned the data), so a
-    # person appearing in several charts gets a single combined note.
+    # Emit the married-surname progression as a note once per person (after all
+    # merges have unioned the data). Lineage-chart membership stays on
+    # Individual.lineage_lines and is written as custom _GROUP tags by the
+    # writer, rather than as a repetitive freeform note.
     for ind in ordered:
         if ind.married_surnames:
             ind.note_list.insert(
                 0, "Married surname" + ("s" if len(ind.married_surnames) > 1 else "")
                 + ": " + ", then ".join(ind.married_surnames) + ".")
-        if ind.lineage_lines:
-            ind.note_list.append(
-                "Family lines: " + ", ".join(sorted(ind.lineage_lines)) + ".")
     return ordered, families
