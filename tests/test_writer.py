@@ -30,13 +30,28 @@ from family_tree_converter.writer import write_gedcom
     # An intermediate spouse married into a deep family, not a child of the root.
     ("BelAl/Cl/Ar-Dp",   "wife",    "BelAl/Cl/Ar",  "BelAl/Cl/Ar"),
     ("LivAx/Ar-L",       "wife",    "LivAx/Ar",     "LivAx/Ar"),
-    # Multi-marriage chain keeps its base.
-    ("GreJeAds-Ada-EmGe","wife",    "GreJeAds",     "GreJeAds"),
+    # A spouse suffix may follow a digit-ending segment ('P2-J') or be an
+    # unknown given name ('L-?', 'An-?'). These must still classify as a married-
+    # in spouse, not a child of the grandparent (the old letter-letter regex bug
+    # turned John Nolen, the Hynard husband and Annette's husband into children).
+    ("PontHe/P2-J",      "wife",    "PontHe/P2",    "PontHe/P2"),
+    ("PontHe/L-?",       "wife",    "PontHe/L",     "PontHe/L"),
+    ("BelLeAl/An-?",     "wife",    "BelLeAl/An",   "BelLeAl/An"),
+    # A prior-marriage chain (two trailing hyphen suffixes) is the linking
+    # spouse's *earlier* partner, who heads their own family — not a spouse of
+    # the later family.
+    ("GreJeAds-Ada-EmGe","ex_spouse", "GreJeAds-Ada-EmGe", "GreJeAds-Ada-EmGe"),
 ])
 def test_code_classification(code, role, base, self_):
     assert _code_role(code) == role
     assert _code_base(code) == base
     assert _code_self(code) == self_
+
+
+def test_partner_code_for_prior_marriage_chain():
+    from family_tree_converter.reader import _partner_code
+    # George Emberson's chain points back to the linking spouse Ada he married.
+    assert _partner_code("GreJeAds-Ada-EmGe") == "GreJeAds-Ada"
 
 
 @pytest.fixture

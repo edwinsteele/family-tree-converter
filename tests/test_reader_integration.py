@@ -11,6 +11,7 @@ These guard three reader bugs found while linking the Steele line:
 The spreadsheet is local-only (gitignored), so the tests skip when absent.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -344,6 +345,145 @@ def test_remarried_woman_filed_under_maiden_name(parsed):
     assert any("PONTING, then PETTY" in n for n in louisa.note_list)
     # The compound married string must never become the surname.
     assert not any(" then " in (i.surname or "").lower() for i in individuals)
+
+
+def test_digit_or_unknown_spouse_suffix_is_spouse_not_child(parsed):
+    """A spouse code whose suffix follows a digit ('PontHe/P2-J') or is unknown
+    ('PontHe/L-?') must classify as a married-in spouse, not a child of the
+    grandparent. The old letter-letter regex turned three husbands into
+    children of the wrong family."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    henry_child_ids = {c for f in families
+                       if henry.id in (f.husband_id, f.wife_id)
+                       for c in f.child_ids}
+    henry_children = {by_id[c].given_name for c in henry_child_ids}
+
+    # John W. Nolen (PontHe/P2-J) is Phoebe No.2's husband, not Henry's child.
+    john = _one(individuals, "John W.", "NOLEN")
+    assert john.given_name not in henry_children
+    phoebe2 = _one(individuals, "Phoebe Louisa (No.2)", "NOLEN")
+    couple = next((f for f in families
+                   if john.id in (f.husband_id, f.wife_id)
+                   and phoebe2.id in (f.husband_id, f.wife_id)), None)
+    assert couple is not None
+
+    # Phoebe No.2 herself IS Henry's child (a real, deeper relationship).
+    assert phoebe2.id in henry_child_ids
+
+    # Annette's unknown husband (BelLeAl/An-?) must not be a child of BelLeAl;
+    # Annette (née Belshaw, surname recorded only as "?") heads her own marriage.
+    annette = next(i for i in individuals if i.given_name == "Annette (Netta)")
+    annette_fams = [f for f in families
+                    if annette.id in (f.husband_id, f.wife_id)]
+    assert annette_fams  # she heads a marriage, not parented by BelLeAl head
+
+
+def test_prior_marriage_chain_builds_own_family(parsed):
+    """'GreJeAds-Ada-EmGe' is George Emberson, Ada's *first* husband. He must
+    head his own family with Ada (sexed male), not become Jesse Green's wife
+    with an impossible post-mortem marriage date."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    george = next(i for i in individuals
+                  if i.given_name == "George"
+                  and (i.surname or "").upper() == "EMBERSON"
+                  and i.death_date)  # the chain George has d=1901
+    assert george.sex == "M"
+    ada = _one(individuals, "Ada Rebecca", "SMITH")
+
+    # George + Ada is a real couple; George is the husband.
+    geo_fam = next(f for f in families
+                   if george.id in (f.husband_id, f.wife_id)
+                   and ada.id in (f.husband_id, f.wife_id))
+    assert geo_fam.husband_id == george.id
+    assert ada.id == geo_fam.wife_id
+
+    # Ada also married Jesse Green: two distinct families, no marriage after
+    # George's 1901 death attached to George's own family.
+    jesse = next(i for i in individuals if i.given_name == "Jesse Adsley")
+    jesse_fam = next(f for f in families
+                     if jesse.id in (f.husband_id, f.wife_id)
+                     and ada.id in (f.husband_id, f.wife_id))
+    assert jesse_fam.id != geo_fam.id
+    assert "1903" in (jesse_fam.marriage_date or "")
+
+
+def test_remarried_husband_keeps_each_wifes_own_marriage_date(parsed):
+    """Henry Ponting married twice; his single col-31 value (1884) must not
+    overwrite his first wife Maud's own row date (1881). The earlier bug also
+    produced a marriage dated after Maud's 1882 death."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    maud = _one(individuals, "Maud", "PONTING")
+    louisa = _one(individuals, "Louisa Georgina", "RICHEY")
+
+    maud_fam = next(f for f in families
+                    if henry.id in (f.husband_id, f.wife_id)
+                    and maud.id in (f.husband_id, f.wife_id))
+    louisa_fam = next(f for f in families
+                      if henry.id in (f.husband_id, f.wife_id)
+                      and louisa.id in (f.husband_id, f.wife_id))
+
+    assert maud_fam.marriage_date == "1881"
+    assert "Grenfell" in (maud_fam.marriage_place or "")
+    assert louisa_fam.marriage_date == "5 MAR 1884"
+    # Maud's marriage must precede her death, not follow it.
+    assert maud.death_date == "4 JUL 1882"
+
+
+def test_bracket_annotations_moved_out_of_name(parsed):
+    """Editorial annotations like '[Infant death]' or '[MISSIONARY]' must not
+    sit inside the GEDCOM given name; they become a NOTE instead. Parenthetical
+    nicknames ('(Harry)') stay inline."""
+    individuals, _ = parsed
+    # No given name retains a square-bracket annotation.
+    assert not any(re.search(r"\[.*?\]", i.given_name or "") for i in individuals)
+
+    david = _one(individuals, "David", "LIVINGSTONE")
+    assert any("MISSIONARY" in n for n in david.note_list)
+
+    # The two same-named infant Pontings stay distinct (different birth years),
+    # each with the death annotation preserved as a note.
+    mary_anns = [i for i in individuals
+                 if i.given_name == "Mary Ann" and (i.surname or "").upper() == "PONTING"
+                 and any("Infant death" in n for n in i.note_list)]
+    assert len(mary_anns) == 2
+    assert mary_anns[0].birth_date != mary_anns[1].birth_date
+
+    # Nicknames in parentheses are NOT stripped.
+    assert _find(individuals, "(Harry)", "PONTING")
+
+
+def test_longevity_discrepancy_flagged(parsed):
+    """Where col-29 'Longevity' (age at death) contradicts the age implied by
+    the birth and death dates, a discrepancy NOTE flags the likely transcription
+    error — without inventing a corrected date or firing on approximate dates."""
+    individuals, _ = parsed
+
+    def disc_note(i):
+        return [n for n in i.note_list
+                if n.startswith("Recorded age at death")]
+
+    robyn = _one(individuals, "Robyn", "BELSHAW")
+    assert disc_note(robyn) and "(2)" in disc_note(robyn)[0] and "6 years" in disc_note(robyn)[0]
+
+    roger = _one(individuals, "Roger John (George)", "BELSHAW")
+    assert disc_note(roger) and "(72)" in disc_note(roger)[0]
+
+    # Henry Ponting's birth is approximate ('BET 1831 AND 1832'); the fuzzy year
+    # must NOT trigger a spurious discrepancy note.
+    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    assert not disc_note(henry)
+
+    # Exactly the two genuine date/longevity contradictions are flagged.
+    flagged = [i for i in individuals if disc_note(i)]
+    assert len(flagged) == 2
 
 
 def test_lineage_membership_recorded(parsed):

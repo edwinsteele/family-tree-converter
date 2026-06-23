@@ -24,6 +24,7 @@ _C_TOWN = 22
 _C_COUNTY = 23
 _C_DEATH_DATE = 24
 _C_BURIED = 25
+_C_LONGEVITY = 29      # recorded age at death (not emitted; cross-check only)
 _C_MARRIAGE = 31       # marriage date on an individual (spouse) row
 _C_MARRIED_PLACE = 32  # where married, on an individual (spouse) row
 _C_OCCUPATION = 33
@@ -231,6 +232,37 @@ def _date_precision_note(val: Any, label: str) -> str | None:
     )
 
 
+def _longevity_discrepancy_note(
+    birth: str | None, death: str | None, longevity: Any
+) -> str | None:
+    """Flag a contradiction between the recorded age at death (col 29) and the
+    age implied by the emitted birth and death dates.
+
+    Surfaces a likely transcription error for other researchers without
+    asserting *which* fact is wrong (and without inventing a corrected date).
+    Only fires for exact years on both dates and a numeric longevity, and only
+    when they disagree by more than a year — so approximate dates and
+    infant-death 'Months/Days' longevities never produce noise.
+    """
+    if not isinstance(longevity, (int, float)) or not birth or not death:
+        return None
+    if any(q in birth or q in death for q in ("ABT", "BET", "BEF", "AFT", "EST")):
+        return None
+    bm = re.search(r"\b(\d{4})\b", birth)
+    dm = re.search(r"\b(\d{4})\b", death)
+    if not (bm and dm):
+        return None
+    computed = int(dm.group(1)) - int(bm.group(1))
+    age = int(longevity)
+    if abs(computed - age) <= 1:
+        return None
+    return (
+        f"Recorded age at death ({age}) does not match the {computed} years "
+        f"between the recorded birth and death dates — one of these is "
+        f"likely a transcription error."
+    )
+
+
 def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
     """Parse a parent-column value into (given, surname).
 
@@ -266,6 +298,25 @@ def _strip_nee(surname: str) -> str:
     return re.sub(r"\s*\[.*?\]", "", surname).strip()
 
 
+def _clean_given(given: str) -> tuple[str, str | None]:
+    """Split an editorial bracket annotation out of a given name.
+
+    Square-bracket tags like '[Infant death]', '[Child death]' or '[MISSIONARY]'
+    are the genealogist's notes, not part of the name, yet they leak into the
+    GEDCOM NAME field ('Mary Ann [Infant death]'). Strip them and return the
+    annotation so it can be preserved as a NOTE instead. Parenthetical nicknames
+    and disambiguators ('(Harry)', '(No.2)', '(1)') ARE kept inline — they are
+    standard genealogical name notation.
+
+    Returns (clean_given, annotation_or_None).
+    """
+    m = re.search(r"\[(.+?)\]", given)
+    if not m:
+        return given, None
+    clean = re.sub(r"\s*\[.+?\]", "", given).strip()
+    return clean, m.group(1).strip()
+
+
 def _maiden_name(surname: str) -> str | None:
     """Extract the maiden surname from 'MARRIED [née Maiden]'.
 
@@ -297,24 +348,42 @@ def _infer_sex(surname: str) -> str | None:
 
 
 def _code_role(code: str) -> str:
-    """Classify a col-15 code as 'husband', 'wife', or 'child'.
+    """Classify a col-15 code as 'husband', 'wife', 'child', or 'ex_spouse'.
 
     Codes are slash-separated paths into the tree; the role is decided by the
     *final* path segment so nesting depth doesn't matter:
-      'BelAl/Cl/Ar'     → child   (a child of family 'BelAl/Cl')
-      'BelAl/Cl/Ar-Dp'  → wife    (spouse who married into family 'BelAl/Cl/Ar')
-      'BelAl'           → husband (a family head)
-    A trailing '-suffix' on the last segment marks a married-in spouse and wins
-    over the '/' that merely signals depth.
+      'BelAl/Cl/Ar'     → child     (a child of family 'BelAl/Cl')
+      'BelAl/Cl/Ar-Dp'  → wife      (spouse who married into family 'BelAl/Cl/Ar')
+      'BelAl'           → husband   (a family head)
+      'GreJeAds-Ada-EmGe' → ex_spouse (Ada's *prior* husband before Jesse Green)
+    A '-suffix' on the last segment marks a married-in spouse and wins over the
+    '/' that merely signals depth. A *second* trailing '-suffix' (two hyphens in
+    the last segment) marks a prior-marriage chain: the deepest token is the
+    earlier spouse of the person named by the rest of the segment. The hyphen
+    suffix can follow a digit ('P2-J') or be unknown ('L-?'), so split on the
+    hyphen rather than requiring letters on both sides.
     """
     if not code:
         return "unknown"
     last = code.rsplit("/", 1)[-1]
-    if re.search(r"[A-Za-z]-[A-Za-z]", last):
+    hyphens = last.count("-")
+    if hyphens >= 2:
+        return "ex_spouse"
+    if hyphens == 1:
         return "wife"
     if "/" in code:
         return "child"
     return "husband"
+
+
+def _partner_code(code: str) -> str:
+    """For a prior-spouse chain, the code of the linking spouse they married.
+
+    'GreJeAds-Ada-EmGe' (George, Ada's prior husband) → 'GreJeAds-Ada' (Ada).
+    """
+    path, _, last = code.rpartition("/")
+    last = last.rsplit("-", 1)[0]
+    return f"{path}/{last}" if path else last
 
 
 def _code_base(code: str) -> str:
@@ -447,18 +516,25 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             })
         elif generation != "":
             surname = str(v(r, _C_SURNAME)).strip()
-            given = str(v(r, _C_GIVEN)).strip()
+            given, given_annotation = _clean_given(str(v(r, _C_GIVEN)).strip())
             father = str(v(r, _C_FATHER)).strip()
             # '|' is an occasional typo for the '/' child separator
             code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_base = _strip_nee(surname)
 
             person_notes = list(row_notes.get(r, []))
+            if given_annotation:
+                person_notes.append(f"Name annotation: [{given_annotation}].")
             for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death"),
                               (_C_MARRIAGE, "Marriage")):
                 pn = _date_precision_note(v(r, cell), lbl)
                 if pn:
                     person_notes.append(pn)
+            ld = _longevity_discrepancy_note(
+                _parse_date(v(r, _C_DATE1)), _parse_date(v(r, _C_DEATH_DATE)),
+                v(r, _C_LONGEVITY))
+            if ld:
+                person_notes.append(ld)
 
             person_rows.append({
                 "row": r,
@@ -629,6 +705,12 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         if p["role"] in ("husband", "child"):
             code_to_head.setdefault(_code_self(p["code"]), dedup_map[p["dedup_key"]])
 
+    # Literal code → individual, so a prior-spouse chain ('GreJeAds-Ada-EmGe')
+    # can find the linking spouse it married ('GreJeAds-Ada').
+    full_code_to_ind: dict[str, Individual] = {}
+    for p in person_rows:
+        full_code_to_ind.setdefault(p["code"], dedup_map[p["dedup_key"]])
+
     def _open_family(base: str, husband_id: str | None = None) -> Family:
         nonlocal _fam_counter
         if husband_id is None:
@@ -754,6 +836,22 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
                 fam.child_ids.append(ind.id)
             # If no matching family, the child is an unresolved reference — skip.
 
+        elif role == "ex_spouse":
+            # A prior-marriage chain: this person married the linking spouse
+            # ('GreJeAds-Ada') in an earlier marriage, so they head their own
+            # family with that spouse — NOT a member of the later family. Place
+            # the partner opposite by sex (a née-female partner ⇒ this is the
+            # husband) and let the final sweep fill the remaining sex.
+            partner = full_code_to_ind.get(_partner_code(data["code"]))
+            if partner is not None:
+                if partner.sex == "M":
+                    h_id, w_id = ind.id, partner.id
+                else:
+                    h_id, w_id = partner.id, ind.id
+                _fam_counter += 1
+                families.append(Family(id=f"F{_fam_counter}",
+                                       husband_id=h_id, wife_id=w_id))
+
     # ------------------------------------------------------------------
     # Post-process: swap husband/wife when the assigned "husband" is
     # demonstrably female (has née in surname). This corrects for families
@@ -775,20 +873,32 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     # wife's row is a fallback when the husband has no recorded date.
     row_marr: dict[str, dict] = {}
     for p in person_rows:
-        if p["role"] not in ("husband", "wife"):
+        if p["role"] not in ("husband", "wife", "ex_spouse"):
             continue
         if not (p["marr_date"] or p["marr_place"]):
             continue
         row_marr.setdefault(dedup_map[p["dedup_key"]].id, p)
+    # A person who married more than once carries a single col-31 value that
+    # describes only one of their marriages, so it must not be copied onto every
+    # family they belong to (e.g. Henry Ponting's 1884 date leaking onto his
+    # first wife Maud's family). Prefer the spouse who appears in the *fewest*
+    # families — their col-31 unambiguously refers to this marriage — and break
+    # ties husband-first.
+    spouse_fam_count: dict[str, int] = {}
+    for fam in families:
+        for sid in (fam.husband_id, fam.wife_id):
+            if sid:
+                spouse_fam_count[sid] = spouse_fam_count.get(sid, 0) + 1
     for fam in families:
         if fam.marriage_date or fam.marriage_place:
             continue
-        for sid in (fam.husband_id, fam.wife_id):
-            src = row_marr.get(sid)
-            if src is not None:
-                fam.marriage_date = src["marr_date"]
-                fam.marriage_place = src["marr_place"]
-                break
+        cands = [s for s in (fam.husband_id, fam.wife_id) if s and s in row_marr]
+        cands.sort(key=lambda s: (spouse_fam_count.get(s, 0),
+                                  0 if s == fam.husband_id else 1))
+        if cands:
+            src = row_marr[cands[0]]
+            fam.marriage_date = src["marr_date"]
+            fam.marriage_place = src["marr_place"]
 
     # ------------------------------------------------------------------
     # Pass 3.5 – loose given-name-only children
@@ -965,6 +1075,7 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         flag = str(v(r, _C_FLAG)).strip()
         # Strip clarifying annotations like "John {Maud's father}".
         given = re.sub(r"\s*\{.*?\}", "", str(v(r, _C_GIVEN)).strip()).strip()
+        given, given_annotation = _clean_given(given)
         surname_base = _strip_nee(surname)
         father_raw = str(v(r, _C_FATHER)).strip()
         mother_raw = str(v(r, _C_MOTHER)).strip()
@@ -983,6 +1094,8 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
             block_people[key] = rec
             block_order.append(key)
         block_notes = list(row_notes.get(r, []))
+        if given_annotation:
+            block_notes.append(f"Name annotation: [{given_annotation}].")
         pn = _date_precision_note(v(r, _C_DATE1), "Birth" if flag == "B" else "Death")
         if pn:
             block_notes.append(pn)
