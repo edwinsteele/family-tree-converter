@@ -67,11 +67,14 @@ def write_gedcom(
         if ind.sex:
             lines.append(f"1 SEX {ind.sex}")
 
-        # Principal-lineage chart membership as a custom (underscore) tag, the
-        # GEDCOM convention for non-standard data: filterable, preserved by
-        # tolerant importers, safely ignored by strict ones.
+        # Principal-lineage chart membership as a standard GEDCOM 5.5.1 custom
+        # attribute (FACT with a user-defined TYPE). Unlike the earlier custom
+        # '_GROUP' underscore tag, this is parsed natively by importers such as
+        # MacFamilyTree — it appears as a filterable "Lineage" fact rather than
+        # an "unparsable tag" — while staying conformant.
         for line_name in sorted(ind.lineage_lines):
-            lines.append(f"1 _GROUP {line_name}")
+            lines.append(f"1 FACT {line_name}")
+            lines.append("2 TYPE Lineage")
 
         if ind.birth_date or ind.birth_place:
             tag = "CHR" if ind.birth_is_christening else "BIRT"

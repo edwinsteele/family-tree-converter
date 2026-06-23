@@ -161,9 +161,10 @@ def test_marriage_from_spouse_row_emitted(tmp_path):
     assert "2 PLAC Barony, Scotland" in text
 
 
-def test_lineage_lines_emitted_as_group_tags(tmp_path):
-    """Lineage-chart membership is written as custom _GROUP tags, one per line,
-    in sorted order — not as a freeform NOTE."""
+def test_lineage_lines_emitted_as_typed_facts(tmp_path):
+    """Lineage-chart membership is written as standard FACT/TYPE attributes (one
+    per line, sorted) so importers like MacFamilyTree parse them natively —
+    not as a custom _GROUP tag and not as a freeform NOTE."""
     ind = Individual(
         id="I1", given_name="Daniel", surname="LIVINGSTONE", sex="M",
         lineage_lines={"Williams", "Livingstone"},
@@ -171,10 +172,12 @@ def test_lineage_lines_emitted_as_group_tags(tmp_path):
     out = tmp_path / "t.ged"
     write_gedcom([ind], [], out)
     text = out.read_text()
-    assert "1 _GROUP Livingstone" in text
-    assert "1 _GROUP Williams" in text
+    assert "1 FACT Livingstone\n2 TYPE Lineage" in text
+    assert "1 FACT Williams\n2 TYPE Lineage" in text
     # Sorted: Livingstone precedes Williams.
-    assert text.index("_GROUP Livingstone") < text.index("_GROUP Williams")
+    assert text.index("FACT Livingstone") < text.index("FACT Williams")
+    # No custom underscore tag and no freeform "Family lines:" note remain.
+    assert "_GROUP" not in text
     assert "Family lines:" not in text
 
 
