@@ -4,8 +4,37 @@ from pathlib import Path
 
 import pytest
 
-from family_tree_converter.reader import Family, Individual, _parse_approx_string, _parse_date
+from family_tree_converter.reader import (
+    Family,
+    Individual,
+    _code_base,
+    _code_role,
+    _code_self,
+    _parse_approx_string,
+    _parse_date,
+)
 from family_tree_converter.writer import write_gedcom
+
+
+@pytest.mark.parametrize("code, role, base, self_", [
+    # Top-level family head and its spouse / children.
+    ("HntJm",            "husband", "HntJm",        "HntJm"),
+    ("HntJm-Ca",         "wife",    "HntJm",        "HntJm"),
+    ("HntJm/Jn",         "child",   "HntJm",        "HntJm/Jn"),
+    # Deep nesting: a child belongs to its *immediate* parent, not the root.
+    ("BelAl/Cl/Ar",      "child",   "BelAl/Cl",     "BelAl/Cl/Ar"),
+    ("BelAl/Cl/Ar/Dv",   "child",   "BelAl/Cl/Ar",  "BelAl/Cl/Ar/Dv"),
+    ("BelAl/Cl/Ar/Dv/T", "child",   "BelAl/Cl/Ar/Dv", "BelAl/Cl/Ar/Dv/T"),
+    # An intermediate spouse married into a deep family, not a child of the root.
+    ("BelAl/Cl/Ar-Dp",   "wife",    "BelAl/Cl/Ar",  "BelAl/Cl/Ar"),
+    ("LivAx/Ar-L",       "wife",    "LivAx/Ar",     "LivAx/Ar"),
+    # Multi-marriage chain keeps its base.
+    ("GreJeAds-Ada-EmGe","wife",    "GreJeAds",     "GreJeAds"),
+])
+def test_code_classification(code, role, base, self_):
+    assert _code_role(code) == role
+    assert _code_base(code) == base
+    assert _code_self(code) == self_
 
 
 @pytest.fixture

@@ -265,23 +265,58 @@ def _infer_sex(surname: str) -> str | None:
 
 
 def _code_role(code: str) -> str:
-    """Classify a col-15 code as 'husband', 'wife', or 'child'."""
+    """Classify a col-15 code as 'husband', 'wife', or 'child'.
+
+    Codes are slash-separated paths into the tree; the role is decided by the
+    *final* path segment so nesting depth doesn't matter:
+      'BelAl/Cl/Ar'     → child   (a child of family 'BelAl/Cl')
+      'BelAl/Cl/Ar-Dp'  → wife    (spouse who married into family 'BelAl/Cl/Ar')
+      'BelAl'           → husband (a family head)
+    A trailing '-suffix' on the last segment marks a married-in spouse and wins
+    over the '/' that merely signals depth.
+    """
     if not code:
         return "unknown"
+    last = code.rsplit("/", 1)[-1]
+    if re.search(r"[A-Za-z]-[A-Za-z]", last):
+        return "wife"
     if "/" in code:
         return "child"
-    if re.search(r"[A-Za-z]-[A-Za-z]", code):
-        return "wife"
     return "husband"
 
 
 def _code_base(code: str) -> str:
-    """Extract family base from a code: 'HntJm/Jn' → 'HntJm', 'HntJm-Ca' → 'HntJm'."""
+    """Return the base code of the family this person *belongs to*.
+
+    A child of 'A/B/C' belongs to the family headed by its immediate parent
+    'A/B' (not the top ancestor 'A'). A spouse 'A/B-X' married into family
+    'A/B'. Examples:
+      'HntJm/Jn'     → 'HntJm'      (child)
+      'BelAl/Cl/Ar'  → 'BelAl/Cl'   (child, immediate parent)
+      'HntJm-Ca'     → 'HntJm'      (wife)
+      'BelAl/Cl/Ar-Dp' → 'BelAl/Cl/Ar' (wife)
+    """
+    if _code_role(code) == "wife":
+        # Strip the spouse suffix from the final path segment.
+        path, _, last = code.rpartition("/")
+        last_base = last.split("-", 1)[0]
+        return f"{path}/{last_base}" if path else last_base
     if "/" in code:
-        return code.split("/")[0]
-    m = re.match(r"^([A-Za-z]+)-[A-Za-z]", code)
-    if m:
-        return m.group(1)
+        # Child: belongs to the family headed by its immediate parent.
+        return code.rsplit("/", 1)[0]
+    return code
+
+
+def _code_self(code: str) -> str:
+    """Return the base code of the family this person *heads*.
+
+    Husbands and children head a family identified by their own code path
+    ('BelAl/Cl/Ar' for the child Arthur, whose own children are 'BelAl/Cl/Ar/*').
+    Spouses don't head a family of their own; they join their partner's, so
+    their self-base is the family they married into.
+    """
+    if _code_role(code) == "wife":
+        return _code_base(code)
     return code
 
 
@@ -514,6 +549,65 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     # Maps base code → the most recently opened Family with that base
     active_family: dict[str, Family] = {}
 
+    # Maps a code to the individual who heads the family of that code, so an
+    # intermediate child (e.g. 'BelAl/Cl/Ar') can anchor a family that its own
+    # children ('BelAl/Cl/Ar/Dv') and spouse ('BelAl/Cl/Ar-Dp') attach to.
+    code_to_head: dict[str, Individual] = {}
+    for p in person_rows:
+        if p["role"] in ("husband", "child"):
+            code_to_head.setdefault(_code_self(p["code"]), dedup_map[p["dedup_key"]])
+
+    def _open_family(base: str, husband_id: str | None = None) -> Family:
+        nonlocal _fam_counter
+        if husband_id is None:
+            head = code_to_head.get(base)
+            husband_id = head.id if head else None
+        _fam_counter += 1
+        fam = Family(id=f"F{_fam_counter}", husband_id=husband_id, _husband_base=base)
+        families.append(fam)
+        active_family[base] = fam
+        return fam
+
+    def _find_head_code(base: str) -> str | None:
+        """Map a family base to a known head code, tolerating abbreviation.
+
+        Codes are sometimes abbreviated inconsistently — Barbara's own code is
+        'BelAl/Rg/Do/Ba' but her spouses reference 'BelAl/Rg/Do/B'. Match within
+        the *same parent path* and accept a final segment that is a prefix of
+        (or prefixed by) the head's, preferring the longest (most specific) one.
+        """
+        if base in code_to_head:
+            return base
+        bpath, _, blast = base.rpartition("/")
+        best: str | None = None
+        for hc in code_to_head:
+            hpath, _, hlast = hc.rpartition("/")
+            if hpath != bpath:
+                continue
+            if hlast.startswith(blast) or blast.startswith(hlast):
+                if best is None or len(hc) > len(best):
+                    best = hc
+        return best
+
+    def _family_for(base: str, create: bool = True) -> Family | None:
+        """Resolve (and optionally lazily anchor) the family for a base code."""
+        fam = active_family.get(base)
+        if fam is not None:
+            return fam
+        hc = _find_head_code(base)
+        if hc is None:
+            return None
+        if hc in active_family:
+            active_family[base] = active_family[hc]  # alias the abbreviation
+            return active_family[hc]
+        if not create:
+            return None
+        head = code_to_head.get(hc)
+        fam = _open_family(hc, husband_id=head.id if head else None)
+        if hc != base:
+            active_family[base] = fam  # alias so sibling codes resolve here too
+        return fam
+
     # Spouse-id → Individual, for matching marriage rows to families by name.
     id_to_ind = {ind.id: ind for ind in dedup_map.values()}
 
@@ -558,36 +652,32 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
 
         if role == "husband":
             existing = active_family.get(base)
-            if existing is not None and existing.husband_id is None:
-                # Spouse appeared before family-head (female-headed entry) — reuse
+            if existing is not None and existing.husband_id in (None, ind.id):
+                # Family already opened — either a spouse appeared first
+                # (female-headed entry, husband_id still None) or it was
+                # lazily anchored with this same person as head. Reuse it
+                # rather than creating a duplicate.
                 existing.husband_id = ind.id
-                fam = existing
             else:
-                _fam_counter += 1
-                fam = Family(id=f"F{_fam_counter}", husband_id=ind.id, _husband_base=base)
-                families.append(fam)
-                active_family[base] = fam
+                _open_family(base, husband_id=ind.id)
 
         elif role == "wife":
-            fam = active_family.get(base)
-            if fam is None:
-                # Wife with no preceding husband row — create a family
-                _fam_counter += 1
-                fam = Family(id=f"F{_fam_counter}", _husband_base=base)
-                families.append(fam)
-                active_family[base] = fam
+            # The family she married into may not have been opened yet — an
+            # intermediate head (e.g. child 'BelAl/Cl/Ar') only anchors a family
+            # lazily, when its first spouse or child appears. Fall back to a
+            # headless family only if no head can be resolved at all.
+            fam = _family_for(base) or _open_family(base)
+            if fam.wife_id is not None and fam.wife_id != ind.id:
+                # A second spouse on the same base is a remarriage — open a
+                # parallel family sharing the same head so it isn't dropped.
+                fam = _open_family(base, husband_id=fam.husband_id)
             if fam.wife_id is None:
                 fam.wife_id = ind.id
 
         elif role == "child":
-            fam = active_family.get(base)
-            if fam is None:
-                # Try prefix match: child codes are sometimes abbreviated vs parent base
-                # e.g. child base 'PettL' matches family base 'PettLuGe'
-                for fb, f in reversed(list(active_family.items())):
-                    if fb.startswith(base) or base.startswith(fb):
-                        fam = f
-                        break
+            # Anchor the immediate-parent family lazily; abbreviated child codes
+            # (e.g. 'PettL' vs family 'PettLuGe') resolve via _find_head_code.
+            fam = _family_for(base)
             if fam is not None:
                 fam.child_ids.append(ind.id)
             # If no matching family, the child is an unresolved reference — skip.
@@ -659,14 +749,39 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
     parent_fams: dict[tuple[str | None, str | None], Family] = {}
     already_child: set[str] = {cid for fam in families for cid in fam.child_ids}
 
+    def _descendants(root_id: str | None) -> set[str]:
+        """Ids reachable as descendants of root_id through current families."""
+        if root_id is None:
+            return set()
+        seen: set[str] = set()
+        stack = [root_id]
+        while stack:
+            cur = stack.pop()
+            for fam in families:
+                if cur in (fam.husband_id, fam.wife_id):
+                    for c in fam.child_ids:
+                        if c not in seen:
+                            seen.add(c)
+                            stack.append(c)
+        return seen
+
     def _resolve_parent(
-        parsed: tuple[str | None, str | None] | None, sex: str
+        parsed: tuple[str | None, str | None] | None,
+        sex: str,
+        avoid: frozenset[str] = frozenset(),
     ) -> Individual | None:
         nonlocal _id_counter
         if parsed is None or (parsed[0] is None and parsed[1] is None):
             return None
         key = _ind_name_key(parsed[0], parsed[1])
         parent = existing_by_name.get(key) or synth_by_name.get(key)
+        # A loose name match (surname + first given word) can collide with a
+        # descendant of the very person we are giving parents to — e.g. Bruce
+        # Dallas's father "William H. Dallas" matching his grandson "William
+        # John Peter Dallas". Such a match would invert the tree, so reject it
+        # and mint a distinct ancestor instead.
+        if parent is not None and parent.id in avoid:
+            parent = None
         if parent is None:
             _id_counter += 1
             parent = Individual(
@@ -690,8 +805,9 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         if fp is None and mp is None:
             continue
 
-        father_ind = _resolve_parent(fp, "M")
-        mother_ind = _resolve_parent(mp, "F")
+        avoid = frozenset(_descendants(ind.id) | {ind.id})
+        father_ind = _resolve_parent(fp, "M", avoid)
+        mother_ind = _resolve_parent(mp, "F", avoid)
 
         if father_ind is None and mother_ind is None:
             continue
@@ -849,8 +965,9 @@ def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
         mp = _parse_parent_name(rec["mother_raw"])
         if fp is None and mp is None:
             continue
-        father_ind = _resolve_parent(fp, "M")
-        mother_ind = _resolve_parent(mp, "F")
+        avoid = frozenset(_descendants(ind.id) | {ind.id})
+        father_ind = _resolve_parent(fp, "M", avoid)
+        mother_ind = _resolve_parent(mp, "F", avoid)
         if father_ind is None and mother_ind is None:
             continue
         fam = _parent_family(

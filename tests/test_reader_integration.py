@@ -149,6 +149,111 @@ def test_marriage_not_misattributed_to_unrelated_family(parsed):
             assert any(s and s.surname for s in spouses)
 
 
+def _parent_family(families, child_id):
+    return next((f for f in families if child_id in f.child_ids), None)
+
+
+def _one(individuals, given, surname):
+    matches = [
+        i for i in individuals
+        if i.given_name == given and (i.surname or "").upper() == surname.upper()
+    ]
+    assert len(matches) == 1, f"expected one {given} {surname}, got {len(matches)}"
+    return matches[0]
+
+
+def test_hierarchical_codes_nest_by_generation(parsed):
+    """Deep codes like 'LivAx/Ar/...' must nest under their immediate parent,
+    not collapse onto the top ancestor (the old _code_base bug)."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    alex = _one(individuals, "Alexander", "LIVINGSTONE")
+    norma = _one(individuals, "Norma Ethel", "DENIGAN")
+    adrienne = _one(individuals, "Adrienne Carmel", "KENNA")
+    bernadette = _one(individuals, "Bernadette", "KENNA")
+
+    # Four distinct generations, each child anchored to its immediate parent.
+    norma_parents = _parent_family(families, norma.id)
+    assert norma_parents and alex.id in (norma_parents.husband_id, norma_parents.wife_id)
+
+    adrienne_parents = _parent_family(families, adrienne.id)
+    assert adrienne_parents and norma.id in (
+        adrienne_parents.husband_id, adrienne_parents.wife_id
+    )
+
+    bern_parents = _parent_family(families, bernadette.id)
+    assert bern_parents and adrienne.id in (
+        bern_parents.husband_id, bern_parents.wife_id
+    )
+
+    # The great-grandchildren must NOT be direct children of Alexander.
+    alex_fam = next(f for f in families if alex.id in (f.husband_id, f.wife_id))
+    alex_child_names = {by_id[c].given_name for c in alex_fam.child_ids}
+    assert "Bernadette" not in alex_child_names
+    assert "Adrienne Carmel" not in alex_child_names  # granddaughter, not child
+
+
+def test_no_family_has_collapsed_fanout(parsed):
+    """No family should accumulate the dozens of mixed-surname descendants that
+    the collapse bug produced (Alexander Livingstone had 50, John Allan Belshaw
+    67)."""
+    _, families = parsed
+    biggest = max(len(f.child_ids) for f in families)
+    assert biggest <= 15, f"a family still has {biggest} children"
+
+
+def test_intermediate_spouse_is_spouse_not_child(parsed):
+    """An '.../X-Y' code is a married-in spouse of a deep family, not a child of
+    the top ancestor."""
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+
+    daphne = _one(individuals, "Daphne Edith", "FAULK")
+    arthur = _one(individuals, "Arthur Silas", "FAULK")
+    john_allan = _one(individuals, "John Allan (Allan)", "BELSHAW")
+
+    # Daphne is Arthur's wife, sharing a family with him.
+    couple = next(
+        (f for f in families
+         if arthur.id in (f.husband_id, f.wife_id)
+         and daphne.id in (f.husband_id, f.wife_id)),
+        None,
+    )
+    assert couple is not None
+    # She must not have been swept up as a child of the top ancestor.
+    top = next(f for f in families if john_allan.id in (f.husband_id, f.wife_id))
+    assert daphne.id not in top.child_ids
+
+
+def test_no_parent_child_cycles(parsed):
+    """The Pass-4 cycle guard must keep anyone from becoming their own ancestor
+    (e.g. Bruce Dallas's father 'William H.' matching grandson 'William John
+    Peter')."""
+    _, families = parsed
+    parents_of = {}
+    for f in families:
+        for c in f.child_ids:
+            parents_of.setdefault(c, set()).update(
+                p for p in (f.husband_id, f.wife_id) if p
+            )
+
+    def is_ancestor_of_self(start):
+        seen, stack = set(), [start]
+        while stack:
+            cur = stack.pop()
+            for p in parents_of.get(cur, ()):
+                if p == start:
+                    return True
+                if p not in seen:
+                    seen.add(p)
+                    stack.append(p)
+        return False
+
+    cyclic = [c for c in parents_of if is_ancestor_of_self(c)]
+    assert not cyclic
+
+
 def test_bridging_person_is_deduplicated(parsed):
     individuals, families = parsed
     adriennes = _find(individuals, "Adrienne Lois")
