@@ -186,8 +186,9 @@ def _parse_approx_string(s: str) -> str | None:
     if s in ("?", "??", "unknown"):
         return None
 
-    # Normalise separators so "mid.1950s" and "mid 1950s" both match
-    normalised = s.replace(".", " ").strip().lower()
+    # Normalise separators so "mid.1950s" and "mid 1950s" both match, and fold
+    # a typographic apostrophe to a plain one so "Dec'91" / "Dec’91" both match.
+    normalised = s.replace(".", " ").replace("’", "'").strip().lower()
 
     # "v approx YYYY" → "ABT YYYY"
     m = re.match(r"^v\s+approx\s+(\d{4})$", normalised)
@@ -251,6 +252,22 @@ def _parse_approx_string(s: str) -> str | None:
     m = re.match(r"^(c|ca|circa)\s+(\d{4})$", normalised)
     if m:
         return f"ABT {m.group(2)}"
+
+    # Month + (optionally apostrophe-prefixed) year, with an optional approximate
+    # qualifier: "Dec'91" → "DEC 1991", "Approx Dec'91" → "ABT DEC 1991",
+    # "c Jan'05" → "ABT JAN 2005". A two-digit year is windowed at 30
+    # ('00-'29 → 2000s, '30-'99 → 1900s).
+    m = re.match(
+        r"^(?P<qual>approx|circa|ca|c|v\s+approx)?\s*"
+        r"(?P<mon>[a-z]+)\s*'?(?P<yy>\d{2}|\d{4})$",
+        normalised,
+    )
+    if m and m.group("mon") in _MONTH_NAMES:
+        mon = _MONTH_NAMES[m.group("mon")]
+        yy = m.group("yy")
+        year = yy if len(yy) == 4 else str((2000 if int(yy) <= 29 else 1900) + int(yy))
+        prefix = "ABT " if m.group("qual") else ""
+        return f"{prefix}{mon} {year}"
 
     # Month-name forms: "April 1888", "Feb. 1948", "5 June 1789"
     m = re.match(r"^(?:(\d{1,2})\s+)?([a-z]+)\s+(\d{4})$", normalised)

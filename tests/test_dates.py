@@ -32,6 +32,13 @@ from family_tree_converter.reader import _date_precision_note, _parse_approx_str
         ("c. 1920", "ABT 1920"),
         ("approx.1761", "ABT 1761"),
         ("v.approx.1925", "ABT 1925"),
+        # month + apostrophe-year, with/without approximate qualifier
+        ("Dec'91", "DEC 1991"),
+        ("Approx Dec'91", "ABT DEC 1991"),
+        ("Approx Dec’91", "ABT DEC 1991"),  # typographic apostrophe
+        ("c Jan'05", "ABT JAN 2005"),
+        ("Mar'29", "MAR 2029"),  # windowed: '00-'29 → 2000s
+        ("Mar'30", "MAR 1930"),  # windowed: '30-'99 → 1900s
         # unknown → dropped
         ("?", None),
     ],
