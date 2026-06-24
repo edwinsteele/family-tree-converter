@@ -34,6 +34,55 @@ _C_LINE_LAST = 42      # last of the principal-lineage membership columns
 
 DATA_START_ROW = 17
 
+
+@dataclass(frozen=True)
+class FormatProfile:
+    """Per-file layout for a genealogist horizontal-tree spreadsheet.
+
+    The reference file (`BlsGrnLivMcCl`) is described by ``BLSGRN_PROFILE`` below;
+    the additional trees lay their columns out differently (see scripts/profile.py
+    and the per-file maps in project memory), so each gets its own profile and
+    ``read_spreadsheet`` is parameterised on it. Column attributes are 0-based
+    sheet column indices; set one to ``None`` when the file lacks that column.
+    """
+    name: str
+    data_start_row: int
+    generation: int
+    code: int
+    father: int
+    mother: int
+    surname: int
+    given: int
+    date1: int          # birth date (person rows) / marriage date (marriage rows)
+    flag: int           # 'C'=christening, 'M'=marriage row, 'B'/'D' block rows
+    town: int
+    county: int | None  # None when the file uses a single combined place column
+    death_date: int
+    buried: int
+    longevity: int | None
+    marriage: int
+    married_place: int
+    occupation: int
+    notes: int
+    line_first: int     # first lineage-membership column; >= ncols ⇒ no lineage cols
+    # Structural convention used to derive family relationships:
+    #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
+    #   "none"  – no path code; link by generation + parent names + role markers
+    code_convention: str = "alpha"
+
+
+# The reference layout, built from the module constants so the two never drift.
+BLSGRN_PROFILE = FormatProfile(
+    name="BlsGrnLivMcCl",
+    data_start_row=DATA_START_ROW,
+    generation=_C_GENERATION, code=_C_CODE, father=_C_FATHER, mother=_C_MOTHER,
+    surname=_C_SURNAME, given=_C_GIVEN, date1=_C_DATE1, flag=_C_FLAG,
+    town=_C_TOWN, county=_C_COUNTY, death_date=_C_DEATH_DATE, buried=_C_BURIED,
+    longevity=_C_LONGEVITY, marriage=_C_MARRIAGE, married_place=_C_MARRIED_PLACE,
+    occupation=_C_OCCUPATION, notes=_C_NOTES, line_first=_C_LINE_FIRST,
+    code_convention="alpha",
+)
+
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
@@ -497,9 +546,28 @@ def _dedup_key(given: str, surname_base: str, father_raw: str, birth_raw: Any) -
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def read_spreadsheet(path: Path) -> tuple[list[Individual], list[Family]]:
+def read_spreadsheet(
+    path: Path, profile: FormatProfile = BLSGRN_PROFILE
+) -> tuple[list[Individual], list[Family]]:
     wb = xlrd.open_workbook(str(path))
     ws = wb.sheet_by_index(0)
+
+    # Bind the profile's column indices to the historic _C_* / DATA_START_ROW
+    # names as locals, so the parsing body below (and its nested closures) reads
+    # exactly as before but is now driven by the per-file profile. For the
+    # reference profile these equal the module constants, so output is unchanged.
+    p = profile
+    DATA_START_ROW = p.data_start_row
+    _C_GENERATION, _C_CODE, _C_FATHER, _C_MOTHER = (
+        p.generation, p.code, p.father, p.mother)
+    _C_SURNAME, _C_GIVEN, _C_DATE1, _C_FLAG = (
+        p.surname, p.given, p.date1, p.flag)
+    _C_TOWN, _C_COUNTY, _C_DEATH_DATE, _C_BURIED = (
+        p.town, p.county, p.death_date, p.buried)
+    _C_LONGEVITY, _C_MARRIAGE, _C_MARRIED_PLACE = (
+        p.longevity, p.marriage, p.married_place)
+    _C_OCCUPATION, _C_NOTES, _C_LINE_FIRST = (
+        p.occupation, p.notes, p.line_first)
 
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
