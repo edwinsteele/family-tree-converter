@@ -71,13 +71,24 @@ class FormatProfile:
     # person row. Some files leave generation blank and rely on the path code
     # instead — set ``person_row_by_code`` so a non-empty code marks a person.
     person_row_by_code: bool = False
-    # Optional column of per-person status markers (Dv=divorced, Df=previously
-    # divorced, Tw=twin). None when the file has no such column.
+    # Optional column of per-person status markers. In the reference/C&A files
+    # this holds Dv=divorced, Df=previously divorced, Tw=twin; in the no-code
+    # files it holds Sp=married-in spouse, X=appears as both sibling and married.
+    # None when the file has no such column.
     marker: int | None = None
+    # Columns whose Excel cell comments are "not for publication" and must be
+    # excluded from the harvested notes. Empty when the file has no such column.
+    private_note_cols: tuple[int, ...] = ()
     # Structural convention used to derive family relationships:
     #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
     #   "none"  – no path code; link by generation + parent names + role markers
     code_convention: str = "alpha"
+    # When True, person rows that carry no path code (role "unknown") are linked
+    # to their parents by the Father/Mother NAME columns, the way Pass 4 already
+    # links coded family heads. Needed by the half-coded files (e.g. Hcks) whose
+    # later generations are recorded without codes. Off for the fully-coded
+    # reference/C&A files so their output is unchanged.
+    name_link_uncoded: bool = False
 
 
 # The reference layout, built from the module constants so the two never drift.
@@ -111,10 +122,32 @@ CASTL_PROFILE = FormatProfile(
     code_convention="alpha",
 )
 
+# "Hcks:Thos:Krsl H.Tr.#120" — same alpha-code convention as the reference file,
+# but only HALF its rows are coded: the rest are generation-numbered people who
+# name their parents in the Father/Mother columns (linked by name, not code) and
+# a tail of no-generation "compact descendant" rows. The column block is shifted
+# (code@17 vs @15) with the death/marriage/occupation columns landing back in
+# their reference positions. There are no lineage columns; col 16 carries an
+# Sp/X marker (spouse / appears-as-both); cols 35-36 are "not for publication".
+# Column map derived from the file's own row-16 header legend.
+HCKS_PROFILE = FormatProfile(
+    name="Hcks:Thos:Krsl",
+    data_start_row=17,
+    generation=4, code=17, father=18, mother=19, surname=20, given=21,
+    date1=22, flag=23, town=24, county=25, death_date=26, buried=27,
+    longevity=29, marriage=31, married_place=32, occupation=33, notes=34,
+    line_first=999,  # no lineage-membership columns
+    marker=16,  # col 16: Sp (married-in spouse) / X (sibling-and-married)
+    private_note_cols=(35, 36),  # "Not for publication"
+    code_convention="alpha",
+    name_link_uncoded=True,  # half the rows are coded; the rest link by name
+)
+
 # Registry of known per-file profiles, keyed by a substring of the file name.
 PROFILES: dict[str, FormatProfile] = {
     "BlsGrnLivMcCl": BLSGRN_PROFILE,
     "C & A Stl": CASTL_PROFILE,
+    "Hcks:Thos:Krsl": HCKS_PROFILE,
 }
 
 
@@ -693,6 +726,8 @@ def read_spreadsheet(
     # part of any cell's value, so gather them per row, ordered by column.
     row_notes: dict[int, list[str]] = {}
     for (nr, nc), note in sorted(ws.cell_note_map.items()):
+        if nc in p.private_note_cols:
+            continue  # "not for publication"
         text = (note.text or "").strip()
         if text:
             row_notes.setdefault(nr, []).append(text)
@@ -715,6 +750,40 @@ def read_spreadsheet(
             if code:
                 names.add(line_map.get(code, code))
         return names
+
+    # Pre-scan every path code so a cross-tree "bridge spouse" can be told apart
+    # from an ordinary descendant. A code like 'TmJo/P-HckC/Es' means the spouse
+    # of family 'TmJo/P' who is *also* 'HckC/Es' in another subtree (Esther Hicks,
+    # who married Pharaoh Thomas and so bridges the Hicks and Thomas lines). Its
+    # hyphen sits before the final segment, which the generic role parser would
+    # read as a child; here we recognise it because the part before the first
+    # hyphen is itself a known family code and the part after matches a known
+    # person code. Only enabled for files that use the alpha-code convention.
+    all_codes: set[str] = set()
+    if p.code_convention == "alpha":
+        for r in range(DATA_START_ROW, ws.nrows):
+            c = str(v(r, _C_CODE)).strip().replace("|", "/")
+            if c:
+                all_codes.add(c)
+
+    def _bridge_base(code: str) -> str | None:
+        """If ``code`` is a cross-tree bridge spouse, return the base family it
+        married into; otherwise None. See the pre-scan comment above."""
+        if "-" not in code:
+            return None
+        a, _, b = code.partition("-")
+        if not a or not b or a not in all_codes:
+            return None
+        if any(c == b or c.startswith(b) or b.startswith(c) for c in all_codes):
+            return a
+        return None
+
+    def _classify_code(code: str) -> tuple[str, str]:
+        """(role, base) for a path code, recognising bridge spouses first."""
+        bb = _bridge_base(code)
+        if bb is not None:
+            return "wife", bb
+        return _code_role(code), _code_base(code)
 
     # ------------------------------------------------------------------
     # Pass 1 – collect raw person and marriage rows
@@ -772,11 +841,12 @@ def read_spreadsheet(
             if ld:
                 person_notes.append(ld)
 
+            role, base = _classify_code(code)
             person_rows.append({
                 "row": r,
                 "code": code,
-                "role": _code_role(code),
-                "base": _code_base(code),
+                "role": role,
+                "base": base,
                 "father_raw": father,
                 "mother_raw": str(v(r, _C_MOTHER)).strip(),
                 "surname": surname,
@@ -1221,10 +1291,15 @@ def read_spreadsheet(
                             stack.append(c)
         return seen
 
+    def _year_of(date: str | None) -> int | None:
+        m = re.search(r"\b(\d{4})\b", date or "")
+        return int(m.group(1)) if m else None
+
     def _resolve_parent(
         parsed: tuple[str | None, str | None] | None,
         sex: str,
         avoid: frozenset[str] = frozenset(),
+        child_birth: str | None = None,
     ) -> Individual | None:
         nonlocal _id_counter
         if parsed is None or (parsed[0] is None and parsed[1] is None):
@@ -1238,6 +1313,15 @@ def read_spreadsheet(
         # and mint a distinct ancestor instead.
         if parent is not None and parent.id in avoid:
             parent = None
+        # A widened name match (nickname / middle name / maiden surname) can also
+        # land on a same-named person of the wrong generation — e.g. "Dorothy
+        # Julian", mother of a child born 1915, matching Dorothy Williams née
+        # Julian (born 1925). A parent cannot be born on or after their child,
+        # so reject such a match and mint a distinct ancestor instead.
+        if parent is not None and child_birth is not None:
+            py, cy = _year_of(parent.birth_date), _year_of(child_birth)
+            if py is not None and cy is not None and py >= cy:
+                parent = None
         if parent is None:
             _id_counter += 1
             parent = Individual(
@@ -1279,6 +1363,85 @@ def read_spreadsheet(
             parent_fams[pkey] = pf
         parent_fams[pkey].child_ids.append(ind.id)
         already_child.add(ind.id)
+
+    # ------------------------------------------------------------------
+    # Pass 4b – link uncoded person rows by parent name
+    #
+    # Half-coded files record their later generations without path codes: each
+    # such person (role "unknown") names their parents in the Father/Mother
+    # columns instead. Reuse Pass 4's resolution to give them FAMC links, but
+    # first widen the name index so the informal references these files use
+    # actually resolve to the real person rather than minting a duplicate:
+    #   * mothers are named by MAIDEN surname though filed under the married one
+    #     ("Clara Haydon" = Clara Luke née Haydon)
+    #   * people are referenced by NICKNAME ("Dick Julian" = Richard Julian) or
+    #     initials ("R.H. Luke" = Richard Haydon Luke), both held in the NICK
+    #   * or by a middle name ("Leslie Luke" = Alfred Leslie Luke)
+    # A token (given word / nickname) is only indexed when it identifies exactly
+    # one person under that surname, so a shared middle name like "Mary" can
+    # never mislink. References given only by surname ("? Pearce") still miss
+    # and become a mother-only or synthetic parent, reconciled in the audit.
+    # ------------------------------------------------------------------
+    if profile.name_link_uncoded:
+        def _first_word(s: str | None) -> str:
+            s = (s or "").lower().split("(")[0].strip()
+            return s.split()[0] if s.split() else ""
+
+        token_owners: dict[tuple[str, str], set[str]] = {}
+        row_aliases: list[tuple[Individual, set[str], set[str]]] = []
+        for prow in person_rows:
+            ind = dedup_map[prow["dedup_key"]]
+            surnames = {prow["surname_base"].upper()}
+            if prow["maiden"]:
+                surnames.add(prow["maiden"].upper())
+            tokens = set(
+                (prow["given"] or "").lower()
+                .replace("(", " ").replace(")", " ").split()
+            )
+            if prow.get("nickname"):
+                tokens.add(_first_word(prow["nickname"]))
+            tokens.discard("")
+            row_aliases.append((ind, surnames, tokens))
+            for sn in surnames:
+                for tk in tokens:
+                    token_owners.setdefault((sn, tk), set()).add(ind.id)
+        for ind, surnames, tokens in row_aliases:
+            for sn in surnames:
+                for tk in tokens:
+                    if len(token_owners[(sn, tk)]) == 1:
+                        existing_by_name.setdefault((sn, tk), ind)
+
+        for prow in person_rows:
+            if prow["role"] != "unknown":
+                continue
+            ind = dedup_map[prow["dedup_key"]]
+            if ind.id in already_child:
+                continue
+            fp = _parse_parent_name(prow["father_raw"])
+            mp = _parse_parent_name(prow["mother_raw"])
+            # A parent known only by surname (or wholly unknown) is unknown
+            # ancestry — don't mint a nameless placeholder for it.
+            if not (fp and fp[0]):
+                fp = None
+            if not (mp and mp[0]):
+                mp = None
+            if fp is None and mp is None:
+                continue
+            avoid = frozenset(_descendants(ind.id) | {ind.id})
+            father_ind = _resolve_parent(fp, "M", avoid, ind.birth_date)
+            mother_ind = _resolve_parent(mp, "F", avoid, ind.birth_date)
+            if father_ind is None and mother_ind is None:
+                continue
+            pkey = (father_ind.id if father_ind else None,
+                    mother_ind.id if mother_ind else None)
+            if pkey not in parent_fams:
+                _fam_counter += 1
+                pf = Family(id=f"F{_fam_counter}", husband_id=pkey[0],
+                            wife_id=pkey[1])
+                families.append(pf)
+                parent_fams[pkey] = pf
+            parent_fams[pkey].child_ids.append(ind.id)
+            already_child.add(ind.id)
 
     # ------------------------------------------------------------------
     # Pass 5 – flag-based event blocks
