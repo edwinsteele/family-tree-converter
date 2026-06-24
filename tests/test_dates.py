@@ -14,6 +14,7 @@ from family_tree_converter.reader import _date_precision_note, _parse_approx_str
         ("1908-09", "SEP 1908"),
         # uncertain single year → ABT
         ("1828 ??", "ABT 1828"),
+        ("1993 (?)", "ABT 1993"),
         # uncertain decade (ISO and plain) → BET range
         ("194?-02-28", "BET 1940 AND 1949"),
         ("1800s", "BET 1800 AND 1809"),

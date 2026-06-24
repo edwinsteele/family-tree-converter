@@ -64,6 +64,12 @@ def write_gedcom(
     for ind in individuals:
         lines.append(f"0 @{ind.id}@ INDI")
         lines.append(f"1 NAME {ind.given_name} /{ind.surname}/")
+        if ind.nickname:
+            # Formal given name plus a structured nickname, so the familiar form
+            # ("Edie or Cissy") is a proper GEDCOM nickname rather than embedded
+            # in the name field.
+            lines.append(f"2 GIVN {ind.given_name}")
+            lines.append(f"2 NICK {ind.nickname}")
         if ind.sex:
             lines.append(f"1 SEX {ind.sex}")
 
@@ -116,6 +122,8 @@ def write_gedcom(
                 lines.append(f"2 DATE {fam.marriage_date}")
             if fam.marriage_place:
                 lines.append(f"2 PLAC {fam.marriage_place}")
+        if fam.divorced:
+            lines.append("1 DIV Y")
         for child_id in fam.child_ids:
             lines.append(f"1 CHIL @{child_id}@")
         for note in fam.note_list:

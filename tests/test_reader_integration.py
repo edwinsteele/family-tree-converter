@@ -215,7 +215,7 @@ def test_intermediate_spouse_is_spouse_not_child(parsed):
 
     daphne = _one(individuals, "Daphne Edith", "FAULK")
     arthur = _one(individuals, "Arthur Silas", "FAULK")
-    john_allan = _one(individuals, "John Allan (Allan)", "BELSHAW")
+    john_allan = _one(individuals, "John Allan", "BELSHAW")
 
     # Daphne is Arthur's wife, sharing a family with him.
     couple = next(
@@ -355,7 +355,7 @@ def test_digit_or_unknown_spouse_suffix_is_spouse_not_child(parsed):
     individuals, families = parsed
     by_id = {i.id: i for i in individuals}
 
-    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    henry = _one(individuals, "Henry George", "PONTING")
     henry_child_ids = {c for f in families
                        if henry.id in (f.husband_id, f.wife_id)
                        for c in f.child_ids}
@@ -375,7 +375,7 @@ def test_digit_or_unknown_spouse_suffix_is_spouse_not_child(parsed):
 
     # Annette's unknown husband (BelLeAl/An-?) must not be a child of BelLeAl;
     # Annette (née Belshaw, surname recorded only as "?") heads her own marriage.
-    annette = next(i for i in individuals if i.given_name == "Annette (Netta)")
+    annette = next(i for i in individuals if i.given_name == "Annette")
     annette_fams = [f for f in families
                     if annette.id in (f.husband_id, f.wife_id)]
     assert annette_fams  # she heads a marriage, not parented by BelLeAl head
@@ -419,7 +419,7 @@ def test_remarried_husband_keeps_each_wifes_own_marriage_date(parsed):
     individuals, families = parsed
     by_id = {i.id: i for i in individuals}
 
-    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    henry = _one(individuals, "Henry George", "PONTING")
     maud = _one(individuals, "Maud", "PONTING")
     louisa = _one(individuals, "Louisa Georgina", "RICHEY")
 
@@ -440,7 +440,7 @@ def test_remarried_husband_keeps_each_wifes_own_marriage_date(parsed):
 def test_bracket_annotations_moved_out_of_name(parsed):
     """Editorial annotations like '[Infant death]' or '[MISSIONARY]' must not
     sit inside the GEDCOM given name; they become a NOTE instead. Parenthetical
-    nicknames ('(Harry)') stay inline."""
+    nicknames ('(Harry)') are extracted to a structured NICK."""
     individuals, _ = parsed
     # No given name retains a square-bracket annotation.
     assert not any(re.search(r"\[.*?\]", i.given_name or "") for i in individuals)
@@ -456,8 +456,10 @@ def test_bracket_annotations_moved_out_of_name(parsed):
     assert len(mary_anns) == 2
     assert mary_anns[0].birth_date != mary_anns[1].birth_date
 
-    # Nicknames in parentheses are NOT stripped.
-    assert _find(individuals, "(Harry)", "PONTING")
+    # Parenthetical nicknames are extracted from the name into a NICK field.
+    harry = _one(individuals, "Henry George", "PONTING")
+    assert harry.nickname == "Harry"
+    assert "(" not in (harry.given_name or "")
 
 
 def test_longevity_discrepancy_flagged(parsed):
@@ -473,12 +475,12 @@ def test_longevity_discrepancy_flagged(parsed):
     robyn = _one(individuals, "Robyn", "BELSHAW")
     assert disc_note(robyn) and "(2)" in disc_note(robyn)[0] and "6 years" in disc_note(robyn)[0]
 
-    roger = _one(individuals, "Roger John (George)", "BELSHAW")
+    roger = _one(individuals, "Roger John", "BELSHAW")
     assert disc_note(roger) and "(72)" in disc_note(roger)[0]
 
     # Henry Ponting's birth is approximate ('BET 1831 AND 1832'); the fuzzy year
     # must NOT trigger a spurious discrepancy note.
-    henry = _one(individuals, "Henry George (Harry)", "PONTING")
+    henry = _one(individuals, "Henry George", "PONTING")
     assert not disc_note(henry)
 
     # Exactly the two genuine date/longevity contradictions are flagged.

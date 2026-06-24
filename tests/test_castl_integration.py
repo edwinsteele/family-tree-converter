@@ -64,6 +64,43 @@ def test_single_place_column_and_sex(parsed):
     assert edna[0].birth_place and "Richmond" in edna[0].birth_place
 
 
+def test_nickname_extracted_to_field(parsed):
+    individuals, _ = parsed
+    edith = _find(individuals, "Edith Rosetta", "STEELE")
+    assert edith and edith[0].nickname == "Edie or Cissy"
+    assert "(" not in (edith[0].given_name or "")
+
+
+def test_maiden_name_annotation_stripped_from_surname(parsed):
+    individuals, _ = parsed
+    jan = [i for i in individuals if i.given_name == "Janette"
+           and (i.surname or "").upper() == "STEELE"]
+    assert jan, "Janette Steele not found / surname not cleaned"
+    assert "(" not in jan[0].surname
+
+
+def test_divorce_marker_emits_div_on_family(parsed):
+    individuals, families = parsed
+    # The 8 col-5 'Dv' markers become divorce events on their one family each.
+    assert sum(1 for f in families if f.divorced) == 8
+    # Elizabeth Ann Morrison (Sp #1, Dv) — her marriage to Noel is divorced,
+    # his second (to Lee) is not.
+    by_id = {i.id: i for i in individuals}
+    noel = _find(individuals, "Noel", "MORRISON")[0]
+    noel_fams = [f for f in families if noel.id in (f.husband_id, f.wife_id)]
+    divorced = [f for f in noel_fams if f.divorced]
+    assert len(divorced) == 1
+    wife = by_id.get(divorced[0].wife_id)
+    assert wife and "Elizabeth" in (wife.given_name or "")
+
+
+def test_twin_and_prev_divorced_notes(parsed):
+    individuals, _ = parsed
+    notes = "\n".join(n for i in individuals for n in i.note_list)
+    assert notes.count("Recorded as a twin.") == 4
+    assert notes.count("Recorded as previously divorced.") == 1
+
+
 def test_child_parent_chain_linked(parsed):
     individuals, families = parsed
     by_id = {i.id: i for i in individuals}

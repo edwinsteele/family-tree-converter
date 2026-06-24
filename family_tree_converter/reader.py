@@ -71,6 +71,9 @@ class FormatProfile:
     # person row. Some files leave generation blank and rely on the path code
     # instead — set ``person_row_by_code`` so a non-empty code marks a person.
     person_row_by_code: bool = False
+    # Optional column of per-person status markers (Dv=divorced, Df=previously
+    # divorced, Tw=twin). None when the file has no such column.
+    marker: int | None = None
     # Structural convention used to derive family relationships:
     #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
     #   "none"  – no path code; link by generation + parent names + role markers
@@ -104,6 +107,7 @@ CASTL_PROFILE = FormatProfile(
     longevity=16, marriage=18, married_place=19, occupation=20, notes=23,
     line_first=999,  # no lineage-membership columns
     person_row_by_code=True,
+    marker=5,  # col 5: Dv (divorced) / Df (prev. divorced) / Tw (twin)
     code_convention="alpha",
 )
 
@@ -141,6 +145,7 @@ class Individual:
     id: str
     given_name: str
     surname: str
+    nickname: str | None = None
     birth_date: str | None = None
     birth_place: str | None = None
     birth_is_christening: bool = False
@@ -164,6 +169,7 @@ class Family:
     wife_id: str | None = None
     marriage_date: str | None = None
     marriage_place: str | None = None
+    divorced: bool = False
     child_ids: list[str] = field(default_factory=list)
     # Free-text annotations harvested from Excel cell comments on marriage rows.
     note_list: list[str] = field(default_factory=list)
@@ -220,8 +226,8 @@ def _parse_approx_string(s: str) -> str | None:
         year = int(m.group(1))
         return f"BET {year} AND {year + 1}"
 
-    # "1828 ??" → uncertain single year → ABT
-    m = re.match(r"^(\d{4})\s*\?+$", s.strip())
+    # "1828 ??" / "1993 (?)" → uncertain single year → ABT
+    m = re.match(r"^(\d{4})\s*(?:\?+|\(\?\))$", s.strip())
     if m:
         return f"ABT {m.group(1)}"
 
@@ -379,7 +385,10 @@ def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
         '?  Hunter'     → (None, 'Hunter')
         'Joanna  ?'     → ('Joanna', None)
         '?'             → None
+        'Harry(?)'      → ('Harry', None)
     """
+    # Strip a parenthetical uncertainty marker that leaks into the name.
+    raw = re.sub(r"\s*\(\s*\?\s*\)", "", raw)
     s = " ".join(raw.split())
     if not s or s == "?":
         return None
@@ -445,27 +454,54 @@ def _build_place(*parts: str) -> str | None:
 
 
 def _strip_nee(surname: str) -> str:
-    """'SMITH [née JONES]' → 'SMITH'."""
-    return re.sub(r"\s*\[.*?\]", "", surname).strip()
+    """'SMITH [née JONES]' → 'SMITH'; 'STEELE (Maiden Name)' → 'STEELE'.
 
-
-def _clean_given(given: str) -> tuple[str, str | None]:
-    """Split an editorial bracket annotation out of a given name.
-
-    Square-bracket tags like '[Infant death]', '[Child death]' or '[MISSIONARY]'
-    are the genealogist's notes, not part of the name, yet they leak into the
-    GEDCOM NAME field ('Mary Ann [Infant death]'). Strip them and return the
-    annotation so it can be preserved as a NOTE instead. Parenthetical nicknames
-    and disambiguators ('(Harry)', '(No.2)', '(1)') ARE kept inline — they are
-    standard genealogical name notation.
-
-    Returns (clean_given, annotation_or_None).
+    Square-bracket née clauses and parenthetical annotations like '(Maiden Name)'
+    are editorial, not part of the surname.
     """
+    s = re.sub(r"\s*\[.*?\]", "", surname)
+    s = re.sub(r"\s*\(.*?\)", "", s)
+    return s.strip()
+
+
+def _clean_given(given: str) -> tuple[str, str | None, str | None]:
+    """Split editorial annotations and nicknames out of a given name.
+
+    Square-bracket tags like '[Infant death]' or '[MISSIONARY]' are the
+    genealogist's notes, not part of the name; strip them and return the
+    annotation so it can be preserved as a NOTE.
+
+    A trailing parenthetical that is a *name* is a nickname ('Edith Rosetta
+    (Edie or Cissy)', 'James (Jim)') — extract it for a structured GEDCOM NICK.
+    A purely numeric or 'No.' parenthetical is a disambiguator ('(No.2)', '(1)')
+    and STAYS inline. A bare uncertainty marker '(?)' is stripped.
+
+    Returns (clean_given, annotation_or_None, nickname_or_None).
+    """
+    annotation = None
     m = re.search(r"\[(.+?)\]", given)
-    if not m:
-        return given, None
-    clean = re.sub(r"\s*\[.+?\]", "", given).strip()
-    return clean, m.group(1).strip()
+    if m:
+        annotation = m.group(1).strip()
+        given = re.sub(r"\s*\[.+?\]", "", given).strip()
+
+    nickname = None
+    pm = re.search(r"\(([^)]*)\)", given)
+    if pm:
+        content = pm.group(1).strip()
+        if content in ("?", ""):
+            # Uncertainty marker — strip it, keep no nickname.
+            given = re.sub(r"\s*\([^)]*\)", "", given).strip()
+        elif re.fullmatch(r"(no\.?\s*)?\d+", content, re.IGNORECASE):
+            pass  # disambiguator — keep inline
+        elif re.search(r"[A-Za-z]", content):
+            stripped = re.sub(r"\s*\([^)]*\)", "", given).strip()
+            # Only treat it as a nickname if a real given name remains; otherwise
+            # the parenthetical *is* the name (e.g. "(unnamed child)") — keep it.
+            if stripped:
+                nickname = content
+                given = stripped
+
+    return given, annotation, nickname
 
 
 def _maiden_name(surname: str) -> str | None:
@@ -624,6 +660,7 @@ def read_spreadsheet(
         p.longevity, p.marriage, p.married_place)
     _C_OCCUPATION, _C_NOTES, _C_LINE_FIRST = (
         p.occupation, p.notes, p.line_first)
+    _C_MARKER = p.marker
 
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
@@ -641,6 +678,10 @@ def read_spreadsheet(
 
     def _longevity(r: int) -> Any:
         return v(r, _C_LONGEVITY) if _C_LONGEVITY is not None else ""
+
+    def mv(r: int) -> str:
+        """Per-person status marker (Dv/Df/Tw), or '' when no marker column."""
+        return "" if _C_MARKER is None else str(v(r, _C_MARKER)).strip()
 
     def _is_person_row(r: int, code: str, generation: Any) -> bool:
         """A data row describes an individual. Most files number the generation
@@ -706,13 +747,20 @@ def read_spreadsheet(
             })
         elif _is_person_row(r, code, generation):
             surname = str(v(r, _C_SURNAME)).strip()
-            given, given_annotation = _clean_given(str(v(r, _C_GIVEN)).strip())
+            given, given_annotation, nickname = _clean_given(str(v(r, _C_GIVEN)).strip())
             father = str(v(r, _C_FATHER)).strip()
             surname_base = _strip_nee(surname)
+            marker = mv(r)
 
             person_notes = list(row_notes.get(r, []))
             if given_annotation:
                 person_notes.append(f"Name annotation: [{given_annotation}].")
+            # Status markers: twin / previously-divorced become NOTEs on the
+            # person; 'Dv' (this marriage divorced) is handled at family level.
+            if marker == "Tw":
+                person_notes.append("Recorded as a twin.")
+            elif marker == "Df":
+                person_notes.append("Recorded as previously divorced.")
             for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death"),
                               (_C_MARRIAGE, "Marriage")):
                 pn = _date_precision_note(v(r, cell), lbl)
@@ -735,6 +783,8 @@ def read_spreadsheet(
                 "surname_base": surname_base,
                 "maiden": _maiden_name(surname),
                 "given": given,
+                "nickname": nickname,
+                "marker": marker,
                 "birth_date": _parse_date(v(r, _C_DATE1)),
                 "birth_is_chr": flag == "C",
                 "birth_place": _birth_place(r),
@@ -785,6 +835,8 @@ def read_spreadsheet(
                 existing.occupation = p["occupation"]
             if existing.sex is None and p["sex"]:
                 existing.sex = p["sex"]
+            if not existing.nickname and p.get("nickname"):
+                existing.nickname = p["nickname"]
             for n in p["cell_notes"]:
                 if n not in existing.note_list:
                     existing.note_list.append(n)
@@ -806,6 +858,7 @@ def read_spreadsheet(
             id=f"I{_id_counter}",
             given_name=p["given"],
             surname=display_surname,
+            nickname=p.get("nickname"),
             birth_date=p["birth_date"],
             birth_place=p["birth_place"],
             birth_is_christening=p["birth_is_chr"],
@@ -1053,6 +1106,16 @@ def read_spreadsheet(
             if h.sex == "F":
                 fam.husband_id, fam.wife_id = fam.wife_id, fam.husband_id
 
+    # A 'Dv' status marker sits on a married-in spouse whose code maps to exactly
+    # one family — so mark that family as ended in divorce (emitted as 1 DIV).
+    divorced_spouse_ids = {
+        dedup_map[p["dedup_key"]].id
+        for p in person_rows if p.get("marker") == "Dv"
+    }
+    for fam in families:
+        if fam.husband_id in divorced_spouse_ids or fam.wife_id in divorced_spouse_ids:
+            fam.divorced = True
+
     # Attach marriage date/place recorded on the spouses' own rows (cols 31/32).
     # The 'M'-flag marriage rows cover only a fraction of couples; the rest
     # carry their marriage details on each individual's row. Index by spouse id
@@ -1263,7 +1326,7 @@ def read_spreadsheet(
         flag = fv(r)
         # Strip clarifying annotations like "John {Maud's father}".
         given = re.sub(r"\s*\{.*?\}", "", str(v(r, _C_GIVEN)).strip()).strip()
-        given, given_annotation = _clean_given(given)
+        given, given_annotation, nickname = _clean_given(given)
         surname_base = _strip_nee(surname)
         father_raw = str(v(r, _C_FATHER)).strip()
         mother_raw = str(v(r, _C_MOTHER)).strip()
@@ -1275,12 +1338,15 @@ def read_spreadsheet(
         if rec is None:
             rec = {
                 "given": given, "surname_base": surname_base,
+                "nickname": nickname,
                 "father_raw": father_raw, "mother_raw": mother_raw,
                 "birth": None, "death": None, "death_place": None,
                 "sex": _infer_sex(surname), "notes": [],
             }
             block_people[key] = rec
             block_order.append(key)
+        elif nickname and not rec.get("nickname"):
+            rec["nickname"] = nickname
         block_notes = list(row_notes.get(r, []))
         if given_annotation:
             block_notes.append(f"Name annotation: [{given_annotation}].")
@@ -1326,7 +1392,8 @@ def read_spreadsheet(
             _id_counter += 1
             ind = Individual(
                 id=f"I{_id_counter}", given_name=rec["given"],
-                surname=rec["surname_base"], sex=rec["sex"],
+                surname=rec["surname_base"], nickname=rec.get("nickname"),
+                sex=rec["sex"],
             )
             block_created.append(ind)
         # Pin the loose name keys to the first (primary) holder so a later
