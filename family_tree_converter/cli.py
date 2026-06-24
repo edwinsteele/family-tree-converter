@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .reader import read_spreadsheet
+from .reader import profile_for, read_spreadsheet
 from .validate import validate
 from .writer import write_gedcom
 
@@ -29,7 +29,7 @@ def main() -> None:
 
     output_path: Path = args.output or args.input.with_suffix(".ged")
 
-    individuals, families = read_spreadsheet(args.input)
+    individuals, families = read_spreadsheet(args.input, profile_for(args.input))
     write_gedcom(individuals, families, output_path)
 
     print(f"Converted {len(individuals)} individuals and {len(families)} families.")

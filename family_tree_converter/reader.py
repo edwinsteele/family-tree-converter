@@ -54,7 +54,8 @@ class FormatProfile:
     surname: int
     given: int
     date1: int          # birth date (person rows) / marriage date (marriage rows)
-    flag: int           # 'C'=christening, 'M'=marriage row, 'B'/'D' block rows
+    flag: int | None    # 'C'=christening, 'M'=marriage row, 'B'/'D' block rows;
+    #                     None when the file has no such flag column
     town: int
     county: int | None  # None when the file uses a single combined place column
     death_date: int
@@ -65,6 +66,11 @@ class FormatProfile:
     occupation: int
     notes: int
     line_first: int     # first lineage-membership column; >= ncols ⇒ no lineage cols
+    # How a data row is recognised as an individual. The reference file numbers
+    # every person's generation in col 4, so a non-empty generation marks a
+    # person row. Some files leave generation blank and rely on the path code
+    # instead — set ``person_row_by_code`` so a non-empty code marks a person.
+    person_row_by_code: bool = False
     # Structural convention used to derive family relationships:
     #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
     #   "none"  – no path code; link by generation + parent names + role markers
@@ -82,6 +88,39 @@ BLSGRN_PROFILE = FormatProfile(
     occupation=_C_OCCUPATION, notes=_C_NOTES, line_first=_C_LINE_FIRST,
     code_convention="alpha",
 )
+
+# "C & A Stl H.Tree #81" — same alpha-code convention as the reference file but a
+# different, more compact column layout: the code lives in col 6, the name/event
+# block is shifted, birthplace is a single column (no town/county split), there is
+# no christening/marriage flag column, and the generation column is left blank
+# (so person rows are recognised by their code). Marriage dates are per-person
+# (col 18), with no separate 'M' rows. Column map derived from the file's own
+# embedded header row (see scripts/profile.py).
+CASTL_PROFILE = FormatProfile(
+    name="C & A Stl",
+    data_start_row=13,
+    generation=4, code=6, father=8, mother=9, surname=10, given=11,
+    date1=12, flag=None, town=13, county=None, death_date=14, buried=15,
+    longevity=16, marriage=18, married_place=19, occupation=20, notes=23,
+    line_first=999,  # no lineage-membership columns
+    person_row_by_code=True,
+    code_convention="alpha",
+)
+
+# Registry of known per-file profiles, keyed by a substring of the file name.
+PROFILES: dict[str, FormatProfile] = {
+    "BlsGrnLivMcCl": BLSGRN_PROFILE,
+    "C & A Stl": CASTL_PROFILE,
+}
+
+
+def profile_for(path: Path) -> FormatProfile:
+    """Pick the layout profile for a source file by matching its name."""
+    name = Path(path).name
+    for key, prof in PROFILES.items():
+        if key in name:
+            return prof
+    return BLSGRN_PROFILE
 
 _MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -572,6 +611,25 @@ def read_spreadsheet(
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
 
+    def fv(r: int) -> str:
+        """Row flag ('C'/'M'/'B'/'D'), or '' when the file has no flag column."""
+        return "" if _C_FLAG is None else str(v(r, _C_FLAG)).strip()
+
+    def _birth_place(r: int) -> str | None:
+        """Birth/marriage place, honouring files with a single combined place
+        column (county is None) instead of separate town and county columns."""
+        town = str(v(r, _C_TOWN)) if _C_TOWN is not None else ""
+        county = str(v(r, _C_COUNTY)) if _C_COUNTY is not None else ""
+        return _build_place(town, county)
+
+    def _longevity(r: int) -> Any:
+        return v(r, _C_LONGEVITY) if _C_LONGEVITY is not None else ""
+
+    def _is_person_row(r: int, code: str, generation: Any) -> bool:
+        """A data row describes an individual. Most files number the generation
+        (col 4); some leave it blank and mark people by their path code."""
+        return bool(code) if p.person_row_by_code else generation != ""
+
     # Excel cell comments hold the genealogist's research notes (alternate
     # spellings, birth-vs-christening clarifications, sources). They are not
     # part of any cell's value, so gather them per row, ordered by column.
@@ -612,8 +670,9 @@ def read_spreadsheet(
     last_child_base: str | None = None
 
     for r in range(DATA_START_ROW, ws.nrows):
-        flag = str(v(r, _C_FLAG)).strip()
+        flag = fv(r)
         generation = v(r, _C_GENERATION)
+        code = str(v(r, _C_CODE)).strip().replace("|", "/")
 
         if flag == "M":
             combined = str(v(r, _C_GIVEN)).strip()
@@ -625,15 +684,13 @@ def read_spreadsheet(
                 "row": r,
                 "combined": combined,
                 "date": _parse_date(v(r, _C_DATE1)),
-                "place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
+                "place": _birth_place(r),
                 "cell_notes": marr_notes,
             })
-        elif generation != "":
+        elif _is_person_row(r, code, generation):
             surname = str(v(r, _C_SURNAME)).strip()
             given, given_annotation = _clean_given(str(v(r, _C_GIVEN)).strip())
             father = str(v(r, _C_FATHER)).strip()
-            # '|' is an occasional typo for the '/' child separator
-            code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_base = _strip_nee(surname)
 
             person_notes = list(row_notes.get(r, []))
@@ -646,7 +703,7 @@ def read_spreadsheet(
                     person_notes.append(pn)
             ld = _longevity_discrepancy_note(
                 _parse_date(v(r, _C_DATE1)), _parse_date(v(r, _C_DEATH_DATE)),
-                v(r, _C_LONGEVITY))
+                _longevity(r))
             if ld:
                 person_notes.append(ld)
 
@@ -663,7 +720,7 @@ def read_spreadsheet(
                 "given": given,
                 "birth_date": _parse_date(v(r, _C_DATE1)),
                 "birth_is_chr": flag == "C",
-                "birth_place": _build_place(str(v(r, _C_TOWN)), str(v(r, _C_COUNTY))),
+                "birth_place": _birth_place(r),
                 "death_date": _parse_date(v(r, _C_DEATH_DATE)),
                 "death_place": _standardise_place(str(v(r, _C_BURIED)).strip()) or None,
                 # Marriage date/place are recorded on each spouse's own row
@@ -1179,14 +1236,14 @@ def read_spreadsheet(
     block_people: dict[tuple, dict] = {}
     block_order: list[tuple] = []
     for r in range(DATA_START_ROW, ws.nrows):
-        if str(v(r, _C_FLAG)).strip() not in ("B", "D"):
+        if fv(r) not in ("B", "D"):
             continue
         if v(r, _C_GENERATION) != "":
             continue
         surname = str(v(r, _C_SURNAME)).strip()
         if not surname:
             continue
-        flag = str(v(r, _C_FLAG)).strip()
+        flag = fv(r)
         # Strip clarifying annotations like "John {Maud's father}".
         given = re.sub(r"\s*\{.*?\}", "", str(v(r, _C_GIVEN)).strip()).strip()
         given, given_annotation = _clean_given(given)
