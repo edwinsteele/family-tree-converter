@@ -54,7 +54,9 @@ def test_profile_selected_by_name():
 def test_counts_and_integrity(parsed):
     individuals, families = parsed
     # 79 coded + 67 uncoded + 18 no-generation people, plus synthetic ancestors.
-    assert len(individuals) == 196
+    # 198 (not 196): two given-only synthetic mothers ("Alice", "Jane") that
+    # were over-merged across unrelated couples are now kept distinct.
+    assert len(individuals) == 198
     assert len(families) == 72
     result = validate(individuals, families)
     assert result["errors"] == []
@@ -241,3 +243,23 @@ def test_no_duplicate_couple_families(parsed):
     couples = [(f.husband_id, f.wife_id) for f in families
                if f.husband_id and f.wife_id]
     assert len(couples) == len(set(couples))
+
+
+def test_given_only_mothers_not_over_merged(parsed):
+    # A mother recorded by given name only ("Alice", with no surname) must not
+    # be shared across unrelated couples. The two "Alice" references — Edward
+    # Bryan's wife and John Burrowes's wife — are two different women, so they
+    # must be distinct records, each the wife of a different-surnamed husband.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    alices = [i for i in individuals
+              if (i.given_name or "").startswith("Alice") and not (i.surname or "")]
+    assert len(alices) == 2
+    assert len({a.id for a in alices}) == 2  # not the same record reused
+
+    husband_surnames = set()
+    for a in alices:
+        fam = next((f for f in families if f.wife_id == a.id), None)
+        assert fam is not None
+        husband_surnames.add((by_id[fam.husband_id].surname or "").upper())
+    assert husband_surnames == {"BRYAN", "BURROWES"}

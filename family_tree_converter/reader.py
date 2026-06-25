@@ -1361,7 +1361,11 @@ def read_spreadsheet(
         if k != ("", ""):
             existing_by_name.setdefault(k, ind)
 
-    synth_by_name: dict[tuple[str, str], Individual] = {}
+    synth_by_name: dict[tuple, Individual] = {}
+    # Synthetics minted from a GIVEN-NAME-ONLY parent reference. Such a name is
+    # too weak an identity to share across families, so we track these to stop a
+    # later given-only reference collapsing onto one belonging to another couple.
+    surnameless_synth: set[str] = set()
     parent_fams: dict[tuple[str | None, str | None], Family] = {}
     already_child: set[str] = {cid for fam in families for cid in fam.child_ids}
 
@@ -1390,12 +1394,34 @@ def read_spreadsheet(
         sex: str,
         avoid: frozenset[str] = frozenset(),
         child_birth: str | None = None,
+        co_parent: Individual | None = None,
     ) -> Individual | None:
         nonlocal _id_counter
         if parsed is None or (parsed[0] is None and parsed[1] is None):
             return None
         key = _ind_name_key(parsed[0], parsed[1])
-        parent = existing_by_name.get(key) or synth_by_name.get(key)
+        has_surname = bool(parsed[1])
+        # A parent named by GIVEN NAME ONLY (no surname, e.g. a mother recorded
+        # just as "Alice") is a weak identity. It may legitimately reuse a real
+        # or block person, or a sibling's already-minted parent (scoped to the
+        # same co-parent), but it must NEVER collapse onto another family's
+        # given-only synthetic — that would merge two unrelated women who happen
+        # to share a first name (e.g. Edward Bryan's "Alice" vs John Burrowes's
+        # "Alice"). So for a given-only reference, first try the co-parent-scoped
+        # key, then fall back to the plain key but reject a given-only synthetic.
+        # Scoped only for the name-linked files: the reference file's output
+        # depends on the historic plain-key sharing (incl. its block aliases),
+        # which has no given-only over-merge in practice, so it is left as-is.
+        gate = profile.name_link_uncoded
+        parent = None
+        if gate and not has_surname and co_parent is not None:
+            parent = synth_by_name.get(("", co_parent.id, key[1]))
+        if parent is None:
+            cand = existing_by_name.get(key) or synth_by_name.get(key)
+            if (gate and cand is not None and not has_surname
+                    and cand.id in surnameless_synth):
+                cand = None
+            parent = cand
         # A loose name match (surname + first given word) can collide with a
         # descendant of the very person we are giving parents to — e.g. Bruce
         # Dallas's father "William H. Dallas" matching his grandson "William
@@ -1420,7 +1446,14 @@ def read_spreadsheet(
                 surname=parsed[1] or "",
                 sex=sex,
             )
-            synth_by_name[key] = parent
+            if has_surname or not gate:
+                synth_by_name[key] = parent
+            else:
+                # Register only under the co-parent-scoped key so siblings reuse
+                # this parent while other couples don't; track it as given-only.
+                surnameless_synth.add(parent.id)
+                if co_parent is not None:
+                    synth_by_name[("", co_parent.id, key[1])] = parent
         return parent
 
     for _, etype, data in all_events:
@@ -1437,7 +1470,7 @@ def read_spreadsheet(
 
         avoid = frozenset(_descendants(ind.id) | {ind.id})
         father_ind = _resolve_parent(fp, "M", avoid)
-        mother_ind = _resolve_parent(mp, "F", avoid)
+        mother_ind = _resolve_parent(mp, "F", avoid, co_parent=father_ind)
 
         if father_ind is None and mother_ind is None:
             continue
@@ -1566,7 +1599,8 @@ def read_spreadsheet(
             father_ind = (_gen_disambig(fp, child_gen)
                           or _resolve_parent(fp, "M", avoid, ind.birth_date))
             mother_ind = (_gen_disambig(mp, child_gen)
-                          or _resolve_parent(mp, "F", avoid, ind.birth_date))
+                          or _resolve_parent(mp, "F", avoid, ind.birth_date,
+                                             co_parent=father_ind))
             if father_ind is None and mother_ind is None:
                 continue
             pkey = (father_ind.id if father_ind else None,
@@ -1729,7 +1763,7 @@ def read_spreadsheet(
             continue
         avoid = frozenset(_descendants(ind.id) | {ind.id})
         father_ind = _resolve_parent(fp, "M", avoid)
-        mother_ind = _resolve_parent(mp, "F", avoid)
+        mother_ind = _resolve_parent(mp, "F", avoid, co_parent=father_ind)
         if father_ind is None and mother_ind is None:
             continue
         fam = _parent_family(
