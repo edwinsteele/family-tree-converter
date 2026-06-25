@@ -33,3 +33,6 @@ data/input/
 
 # Output files (commit sample output only)
 output/
+
+# Local golden-hash snapshots (per-machine; the tree is not in a public repo)
+tests/golden/

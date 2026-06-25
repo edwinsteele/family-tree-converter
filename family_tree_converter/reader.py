@@ -701,8 +701,16 @@ def _dedup_key(given: str, surname_base: str, father_raw: str, birth_raw: Any) -
 # ---------------------------------------------------------------------------
 
 def read_spreadsheet(
-    path: Path, profile: FormatProfile = BLSGRN_PROFILE
+    path: Path, profile: FormatProfile = BLSGRN_PROFILE,
+    diagnostics: dict | None = None,
 ) -> tuple[list[Individual], list[Family]]:
+    """Parse the spreadsheet into individuals and families.
+
+    When ``diagnostics`` is a dict it is populated (never read) with row-level
+    provenance and minted-record markers for the hardening reports in
+    ``checks.py``. Collecting them only writes to that dict, so the GEDCOM output
+    is byte-for-byte identical whether or not diagnostics are requested.
+    """
     wb = xlrd.open_workbook(str(path))
     ws = wb.sheet_by_index(0)
 
@@ -815,6 +823,49 @@ def read_spreadsheet(
         return _code_role(code), _code_base(code)
 
     # ------------------------------------------------------------------
+    # Diagnostics – row-coverage accounting and minted-record markers.
+    #
+    # Each data row is classified into exactly one bucket so a later report can
+    # flag any name-bearing row that no pass consumed (silent data loss). The
+    # ``consumed_rows`` set is filled by the passes below as they turn rows into
+    # output. Everything here only writes to the ``diagnostics`` dict.
+    # ------------------------------------------------------------------
+    diag = diagnostics
+
+    def _classify_row(r: int) -> str:
+        flag = fv(r)
+        generation = v(r, _C_GENERATION)
+        code = str(v(r, _C_CODE)).strip().replace("|", "/")
+        surname = str(v(r, _C_SURNAME)).strip()
+        given = str(v(r, _C_GIVEN)).strip()
+        if flag == "M":
+            return "marriage"
+        if _is_person_row(r, code, generation):
+            return "coded-person" if code else "gen-person"
+        if flag in ("B", "D") and surname:
+            return "block"
+        if given and not surname and not code:
+            return "loose"
+        if surname or given:
+            return "no-gen"
+        return "blank/layout"
+
+    if diag is not None:
+        diag.setdefault("row_class", {})
+        diag.setdefault("row_text", {})
+        diag.setdefault("consumed_rows", set())
+        diag.setdefault("synthetic_ids", set())
+        diag.setdefault("placeholder_ids", set())
+        diag.setdefault("generation_by_id", {})
+        diag.setdefault("name_linked_family_ids", set())
+        for r in range(DATA_START_ROW, ws.nrows):
+            diag["row_class"][r] = _classify_row(r)
+            surname = str(v(r, _C_SURNAME)).strip()
+            given = str(v(r, _C_GIVEN)).strip()
+            if surname or given:
+                diag["row_text"][r] = (surname, given)
+
+    # ------------------------------------------------------------------
     # Pass 1 – collect raw person and marriage rows
     # ------------------------------------------------------------------
     person_rows: list[dict] = []
@@ -909,6 +960,12 @@ def read_spreadsheet(
                 and not str(v(r, _C_CODE)).strip()
             ):
                 loose_child_rows.append((r, given, last_child_base))
+
+    if diag is not None:
+        # Every person row becomes (or merges into) an individual via Pass 2,
+        # and every marriage row is offered to Pass 3 — all accounted for.
+        diag["consumed_rows"].update(pr["row"] for pr in person_rows)
+        diag["consumed_rows"].update(m["row"] for m in marriage_rows)
 
     # ------------------------------------------------------------------
     # Pass 2 – deduplicate individuals
@@ -1264,6 +1321,10 @@ def read_spreadsheet(
         fam = active_family.get(ctx_base)
         if fam is None:
             continue
+        # The row resolves to a family — whether it is added as a new child or
+        # skipped as a duplicate of one already present, its data is accounted.
+        if diag is not None:
+            diag["consumed_rows"].add(row)
         existing_givens = {
             (id_to_ind[c].given_name or "").lower().split()[0]
             for c in fam.child_ids
@@ -1510,8 +1571,11 @@ def read_spreadsheet(
                 continue
             pkey = (father_ind.id if father_ind else None,
                     mother_ind.id if mother_ind else None)
-            _parent_family_uncoded(pkey).child_ids.append(ind.id)
+            pf = _parent_family_uncoded(pkey)
+            pf.child_ids.append(ind.id)
             already_child.add(ind.id)
+            if diag is not None:
+                diag["name_linked_family_ids"].add(pf.id)
 
     # ------------------------------------------------------------------
     # Pass 5 – flag-based event blocks
@@ -1556,6 +1620,8 @@ def read_spreadsheet(
         surname = str(v(r, _C_SURNAME)).strip()
         if not surname:
             continue
+        if diag is not None:
+            diag["consumed_rows"].add(r)
         flag = fv(r)
         # Strip clarifying annotations like "John {Maud's father}".
         given = re.sub(r"\s*\{.*?\}", "", str(v(r, _C_GIVEN)).strip()).strip()
@@ -1810,6 +1876,8 @@ def read_spreadsheet(
                 ind.note_list.append(extra_note)
             nogen_created.append(ind)
             all_by_id[ind.id] = ind
+            if diag is not None:
+                diag["consumed_rows"].add(row)
             return ind
 
         def _fam_surname(fam: Family | None) -> str:
@@ -1869,6 +1937,8 @@ def read_spreadsheet(
                 cur_family = fam
             if fam is not None:
                 fam.child_ids.append(pending.id)
+                if diag is not None:
+                    diag["name_linked_family_ids"].add(fam.id)
                 if pending_nameless:
                     pending.note_list.append(
                         "Recorded in the source as an unnamed child of this family.")
@@ -1959,6 +2029,8 @@ def read_spreadsheet(
                     target = parent_family or cur_family
                 if target is not None:
                     target.child_ids.append(ind.id)
+                    if diag is not None:
+                        diag["name_linked_family_ids"].add(target.id)
                 if surname_base in ("", "?"):
                     ind.note_list.append(
                         "Recorded as a married daughter; her married surname is "
@@ -2041,4 +2113,26 @@ def read_spreadsheet(
             ind.note_list.insert(
                 0, "Married surname" + ("s" if len(ind.married_surnames) > 1 else "")
                 + ": " + ", then ".join(ind.married_surnames) + ".")
+
+    if diag is not None:
+        # Minted-record markers: synthetic parents are the name-keyed individuals
+        # that never came from a data row (so are absent from every "real" set);
+        # placeholders are the unnamed Pass-6 people.
+        real_ids = ({i.id for i in dedup_map.values()}
+                    | {i.id for i in block_created}
+                    | {i.id for i in nogen_created})
+        diag["synthetic_ids"] = {
+            i.id for i in synth_by_name.values() if i.id not in real_ids
+        }
+        diag["placeholder_ids"] = {
+            i.id for i in nogen_created if i.given_name == "[Unnamed]"
+        }
+        # Generation number (col 4) per individual, for the name-linked
+        # generation-consistency check (a parent sits one generation above).
+        for pr in person_rows:
+            g = v(pr["row"], _C_GENERATION)
+            if isinstance(g, float):
+                diag["generation_by_id"].setdefault(
+                    dedup_map[pr["dedup_key"]].id, g)
+
     return ordered, families

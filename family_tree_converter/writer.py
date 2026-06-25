@@ -48,6 +48,18 @@ def write_gedcom(
     families: list[Family],
     output_path: Path,
 ) -> None:
+    output_path.write_text(render_gedcom(individuals, families), encoding="utf-8")
+
+
+def render_gedcom(
+    individuals: list[Individual],
+    families: list[Family],
+) -> str:
+    """Serialise individuals and families to a GEDCOM 5.5.1 string.
+
+    Factored out of :func:`write_gedcom` so callers (e.g. the golden-hash test)
+    can obtain the exact output bytes without touching the filesystem.
+    """
     # Build back-reference maps required by GEDCOM 5.5.1
     fams: dict[str, list[str]] = defaultdict(list)  # ind_id → [fam_ids as spouse]
     famc: dict[str, list[str]] = defaultdict(list)  # ind_id → [fam_ids as child]
@@ -130,4 +142,4 @@ def write_gedcom(
             lines.extend(_note_lines(note))
 
     lines.append(_TRAILER)
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
