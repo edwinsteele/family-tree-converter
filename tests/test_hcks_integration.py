@@ -6,9 +6,10 @@ their parents in the Father/Mother columns (linked by name, not code). It also
 carries cross-tree "bridge" codes, private "not for publication" note columns,
 and informal parent references (nickname / initials / middle name / maiden).
 
-These tests guard the coded path (Stage 1) and the uncoded name-linking
-(Stage 2). The no-generation "compact descendant" rows (Stage 3) are not yet
-captured, so counts are asserted with thresholds rather than exact values.
+These tests guard the coded path (Stage 1), the uncoded name-linking (Stage 2),
+the no-generation "compact descendant" adjacency pass (Stage 3), and the audit
+reconciliations (Stage 4: name-vs-code mother, generation disambiguation, and
+duplicate-couple merging).
 
 The spreadsheet is local-only (gitignored), so the tests skip when absent.
 """
@@ -52,11 +53,19 @@ def test_profile_selected_by_name():
 
 def test_counts_and_integrity(parsed):
     individuals, families = parsed
-    # 79 coded + 67 uncoded people, plus synthetic ancestors.
-    assert len(individuals) > 160
-    assert len(families) > 55
+    # 79 coded + 67 uncoded + 18 no-generation people, plus synthetic ancestors.
+    assert len(individuals) == 196
+    assert len(families) == 72
     result = validate(individuals, families)
     assert result["errors"] == []
+    assert result["warnings"] == []
+    # Every individual belongs to at least one family (no orphans).
+    in_family = {
+        s for f in families
+        for s in (f.husband_id, f.wife_id, *f.child_ids) if s
+    }
+    assert [i.given_name + " " + i.surname
+            for i in individuals if i.id not in in_family] == []
 
 
 def test_coded_person_read(parsed):
@@ -127,3 +136,108 @@ def test_private_notes_excluded(parsed):
     individuals, _ = parsed
     all_notes = "\n".join(n for i in individuals for n in i.note_list)
     assert "Many details of Pharaoh" not in all_notes
+
+
+# --- Stage 3: no-generation "compact descendant" adjacency ---
+
+def _children(individuals, families, husband_sub, hsur, wife_sub, wsur):
+    by_id = {i.id: i for i in individuals}
+    for f in families:
+        h, w = by_id.get(f.husband_id), by_id.get(f.wife_id)
+        if (h and w and husband_sub in (h.given_name or "")
+                and hsur in (h.surname or "") and wife_sub in (w.given_name or "")
+                and wsur in (w.surname or "")):
+            return f, [by_id[c] for c in f.child_ids]
+    return None, []
+
+
+def test_nogen_spouse_above_pairs_husband(parsed):
+    # Peter Richards has no generation/code; he sits directly above the née-female
+    # Ann Patricia (née Luke) Richards, so he is her husband, and the plain no-gen
+    # rows below (Mark, Sarah) are their children.
+    individuals, families = parsed
+    fam, kids = _children(individuals, families, "Peter", "RICHARDS",
+                          "Ann Patricia", "RICHARDS")
+    assert fam is not None
+    given = sorted(k.given_name for k in kids)
+    assert given == ["Mark", "Sarah"]
+
+
+def test_nogen_nameless_children_get_placeholder(parsed):
+    # John Buchanan + Janet Mary (née Luke) have two children recorded with a
+    # surname only; each is captured under a placeholder name with a note.
+    individuals, families = parsed
+    fam, kids = _children(individuals, families, "John", "BUCHANAN",
+                          "Janet Mary", "BUCHANAN")
+    assert fam is not None and len(kids) == 2
+    for k in kids:
+        assert k.given_name == "[Unnamed]"
+        assert any("unnamed child" in n for n in k.note_list)
+
+
+def test_childless_spouse_orphans_paired(parsed):
+    # The three childless married-in spouses must each land in a family: Edward
+    # Greenslade Pearce (above his née-female wife), George Hartely (Lorna
+    # Kerslake's second husband, matched by her "NAGLE then HARTLEY" surnames
+    # despite the HARTELY/HARTLEY spelling wobble), and Alfred Ernest Luke's
+    # unnamed wife.
+    individuals, families = parsed
+    spouses = {s for f in families for s in (f.husband_id, f.wife_id) if s}
+    for given, sur in (("Edward Greenslade", "PEARCE"), ("George", "HARTELY")):
+        person = _find(individuals, given, sur)[0]
+        assert person.id in spouses
+    # George Hartely is paired specifically with Lorna Kerslake.
+    by_id = {i.id: i for i in individuals}
+    george = _find(individuals, "George", "HARTELY")[0]
+    wives = {by_id[f.wife_id].given_name for f in families
+             if f.husband_id == george.id and f.wife_id}
+    assert "Lorna Ruth" in wives
+
+
+def test_nogen_married_daughter_filed_under_parents(parsed):
+    # Jeanette (née Luke, married surname unknown) is a no-gen married daughter
+    # of Jack (Alfred John) Luke — filed under his family via her maiden name.
+    individuals, families = parsed
+    jeanette = _find(individuals, "Jeanette", "LUKE")[0]
+    father, _ = _parents(individuals, families, jeanette)
+    assert father and father.given_name == "Alfred John"
+
+
+# --- Stage 4: audit reconciliations ---
+
+def test_nicholls_children_reconciled_to_named_mother(parsed):
+    # Charles Nicholls's children are coded under his second marriage (to Lydia
+    # Ann Thomas) but every child names its mother as "Mary Thomas" — his first
+    # wife Mary Louisa (née Thomas). They must be filed under her.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    for given, sur in (("Ethel Marian", "PARKER"), ("Ada Selina", "NICHOLLS"),
+                       ("William C.", "NICHOLLS"), ("Eva L.", "NICHOLLS")):
+        child = _find(individuals, given, sur)[0]
+        _, mother = _parents(individuals, families, child)
+        assert mother is not None and mother.given_name == "Mary Louisa"
+    # Charles + Lydia remains as a (now childless) real marriage.
+    charles = _find(individuals, "Charles", "NICHOLLS")[0]
+    lydia_fams = [f for f in families if f.husband_id == charles.id
+                  and by_id.get(f.wife_id) and by_id[f.wife_id].given_name == "Lydia Ann"]
+    assert lydia_fams and lydia_fams[0].child_ids == []
+
+
+def test_ernest_collision_resolved_by_generation(parsed):
+    # "Ernest Luke" is ambiguous: Alfred Ernest (nicknamed Ernest, b 1880) and
+    # his great-nephew Ernest George (b 1909). Lillian Morgan's father must be
+    # the generation-correct Alfred Ernest, not the younger Ernest George.
+    individuals, families = parsed
+    lillian = _find(individuals, "Lillian", "MORGAN")[0]
+    father, _ = _parents(individuals, families, lillian)
+    assert father and father.given_name == "Alfred Ernest"
+    assert father.birth_date == "1880"
+
+
+def test_no_duplicate_couple_families(parsed):
+    # A path-code family and a name-linked child must not split one couple into
+    # two families (e.g. Arthur Nagle + Lorna Kerslake, Walter Watson + Myrtle).
+    individuals, families = parsed
+    couples = [(f.husband_id, f.wife_id) for f in families
+               if f.husband_id and f.wife_id]
+    assert len(couples) == len(set(couples))

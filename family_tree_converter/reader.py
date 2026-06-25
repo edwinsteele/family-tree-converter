@@ -561,6 +561,35 @@ def _married_surnames(surname_base: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _similar_surname(a: str, b: str) -> bool:
+    """True when two surnames are equal or one transcription typo apart.
+
+    Used only to reconnect an orphaned married-in spouse to the wife whose
+    recorded married surname names him, where the source spelled the surname
+    two slightly different ways (e.g. HARTELY vs HARTLEY). Uses Damerau-
+    Levenshtein distance ≤ 1 (a single insert/delete/substitute/adjacent
+    transposition) and requires a length of at least 5 so short surnames can't
+    coincide.
+    """
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 5 or abs(len(a) - len(b)) > 1:
+        return False
+    la, lb = len(a), len(b)
+    prev2: list[int] = []
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if (i > 1 and j > 1 and a[i - 1] == b[j - 2]
+                    and a[i - 2] == b[j - 1]):
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[lb] <= 1
+
+
 def _infer_sex(surname: str) -> str | None:
     if "née" in surname:
         return "F"
@@ -1411,6 +1440,50 @@ def read_spreadsheet(
                     if len(token_owners[(sn, tk)]) == 1:
                         existing_by_name.setdefault((sn, tk), ind)
 
+        # The genealogist's generation numbers disambiguate a parent name that
+        # is otherwise ambiguous within its surname — a parent sits exactly one
+        # generation above their child.
+        gen_by_id: dict[str, float] = {}
+        for prow in person_rows:
+            g = v(prow["row"], _C_GENERATION)
+            if isinstance(g, float):
+                gen_by_id.setdefault(dedup_map[prow["dedup_key"]].id, g)
+        uncoded_ind_by_id = {i.id: i for i in dedup_map.values()}
+
+        def _gen_disambig(
+            parsed: tuple[str | None, str | None] | None, child_gen: float | None
+        ) -> Individual | None:
+            """Pick the generation-correct individual when a parent name collides
+            with another of the same surname (e.g. "Ernest Luke" = both Alfred
+            Ernest, nicknamed Ernest, and his nephew Ernest George). Only acts
+            when the generation singles out exactly one candidate."""
+            if not parsed or not parsed[0] or child_gen is None or not parsed[1]:
+                return None
+            token = _first_word(parsed[0])
+            cands = token_owners.get((parsed[1].upper(), token), set())
+            if len(cands) <= 1:
+                return None
+            up = [c for c in cands if gen_by_id.get(c) == child_gen + 1]
+            return uncoded_ind_by_id.get(up[0]) if len(up) == 1 else None
+
+        def _parent_family_uncoded(pkey: tuple[str | None, str | None]) -> Family:
+            """Family for a name-linked child's parents, reusing one a path code
+            already built for the same couple so children don't spawn a phantom
+            duplicate of a real (e.g. Arthur Nagle + Lorna Kerslake) family."""
+            nonlocal _fam_counter
+            if pkey in parent_fams:
+                return parent_fams[pkey]
+            if pkey[0] and pkey[1]:
+                for f in families:
+                    if f.husband_id == pkey[0] and f.wife_id == pkey[1]:
+                        parent_fams[pkey] = f
+                        return f
+            _fam_counter += 1
+            pf = Family(id=f"F{_fam_counter}", husband_id=pkey[0], wife_id=pkey[1])
+            families.append(pf)
+            parent_fams[pkey] = pf
+            return pf
+
         for prow in person_rows:
             if prow["role"] != "unknown":
                 continue
@@ -1427,20 +1500,17 @@ def read_spreadsheet(
                 mp = None
             if fp is None and mp is None:
                 continue
+            child_gen = gen_by_id.get(ind.id)
             avoid = frozenset(_descendants(ind.id) | {ind.id})
-            father_ind = _resolve_parent(fp, "M", avoid, ind.birth_date)
-            mother_ind = _resolve_parent(mp, "F", avoid, ind.birth_date)
+            father_ind = (_gen_disambig(fp, child_gen)
+                          or _resolve_parent(fp, "M", avoid, ind.birth_date))
+            mother_ind = (_gen_disambig(mp, child_gen)
+                          or _resolve_parent(mp, "F", avoid, ind.birth_date))
             if father_ind is None and mother_ind is None:
                 continue
             pkey = (father_ind.id if father_ind else None,
                     mother_ind.id if mother_ind else None)
-            if pkey not in parent_fams:
-                _fam_counter += 1
-                pf = Family(id=f"F{_fam_counter}", husband_id=pkey[0],
-                            wife_id=pkey[1])
-                families.append(pf)
-                parent_fams[pkey] = pf
-            parent_fams[pkey].child_ids.append(ind.id)
+            _parent_family_uncoded(pkey).child_ids.append(ind.id)
             already_child.add(ind.id)
 
     # ------------------------------------------------------------------
@@ -1637,11 +1707,313 @@ def read_spreadsheet(
                 m["attached"] = True
                 break
 
+    # ------------------------------------------------------------------
+    # Reconcile a coded child whose recorded mother NAME names a *different*
+    # wife of the same father than the one the path code placed them under.
+    # Charles Nicholls's children are coded under his (second) marriage to Lydia
+    # Ann Thomas, but each names its mother as "Mary Thomas" — his first wife
+    # Mary Louisa (née Thomas), whose own (childless) family already exists via
+    # the ex-spouse path. Move such children onto the parent couple the source
+    # actually names. General, but only fires when the father has two recorded
+    # wives and the child's mother name matches the other one.
+    # ------------------------------------------------------------------
+    recon_by_id = {i.id: i for i in dedup_map.values()}
+    maiden_by_id = {
+        dedup_map[pr["dedup_key"]].id: pr["maiden"]
+        for pr in person_rows if pr["maiden"]
+    }
+    child_mother: dict[str, str] = {}
+    for pr in person_rows:
+        if pr["role"] == "child" and pr["mother_raw"]:
+            child_mother.setdefault(dedup_map[pr["dedup_key"]].id, pr["mother_raw"])
+
+    def _names_wife(parsed: tuple[str | None, str | None] | None,
+                    wife: Individual | None) -> bool:
+        if parsed is None or wife is None:
+            return False
+        g, s = parsed
+        surnames = {(wife.surname or "").upper()}
+        m = maiden_by_id.get(wife.id)
+        if m:
+            surnames.add(m.upper())
+        if s and s.upper() not in surnames:
+            return False
+        if g:
+            gw = g.lower().split()[0]
+            tokens = (wife.given_name or "").lower().replace("(", " ").split()
+            if gw not in tokens and gw != (wife.nickname or "").lower():
+                return False
+        return bool(s or g)
+
+    fams_by_husband: dict[str, list[Family]] = {}
+    for f in families:
+        if f.husband_id:
+            fams_by_husband.setdefault(f.husband_id, []).append(f)
+    for f in families:
+        if not (f.husband_id and f.wife_id):
+            continue
+        co_wives = [g for g in fams_by_husband[f.husband_id]
+                    if g is not f and g.wife_id]
+        if not co_wives:
+            continue
+        wife = recon_by_id.get(f.wife_id)
+        for cid in list(f.child_ids):
+            parsed = _parse_parent_name(child_mother.get(cid, ""))
+            if not (parsed and parsed[0]) or _names_wife(parsed, wife):
+                continue
+            target = next(
+                (g for g in co_wives
+                 if _names_wife(parsed, recon_by_id.get(g.wife_id))),
+                None,
+            )
+            if target is not None and cid not in target.child_ids:
+                f.child_ids.remove(cid)
+                target.child_ids.append(cid)
+
+    # ------------------------------------------------------------------
+    # Pass 6 – no-generation "compact descendant" adjacency
+    #
+    # A tail of rows carry neither a generation number nor a path code: the
+    # genealogist drew them as a compact descendant chart, positioned rather
+    # than coded — a married-in spouse on the row directly ABOVE a née-female
+    # anchor, that couple's children on the rows directly BELOW, several of them
+    # nameless (surname only). Walk the surname-bearing rows in sheet order and:
+    #   * pair a née-female with the immediately preceding row when its surname
+    #     equals her *married* surname — that row is her husband, be it a no-gen
+    #     orphan, a gen-numbered Sp spouse, or her own bloodline husband;
+    #   * treat a no-gen née-female as a married daughter, filing her under the
+    #     family (parents' or current couple's) whose surname matches her
+    #     *maiden* name;
+    #   * attach a plain no-gen row as a child of the current couple, giving a
+    #     nameless one a placeholder name and an explanatory note.
+    # Only the half-coded files set name_link_uncoded; the others never enter.
+    # ------------------------------------------------------------------
+    nogen_created: list[Individual] = []
+    if profile.name_link_uncoded:
+        child_to_fam: dict[str, Family] = {}
+        for fam in families:
+            for cid in fam.child_ids:
+                child_to_fam.setdefault(cid, fam)
+        row_to_ind = {pr["row"]: dedup_map[pr["dedup_key"]] for pr in person_rows}
+        all_by_id: dict[str, Individual] = {
+            i.id: i for i in list(dedup_map.values())
+            + list(synth_by_name.values()) + block_created
+        }
+
+        def _new_ind(given: str, surname: str, row: int,
+                     extra_note: str | None = None) -> Individual:
+            nonlocal _id_counter
+            _id_counter += 1
+            ind = Individual(id=f"I{_id_counter}", given_name=given, surname=surname,
+                             note_list=list(row_notes.get(row, [])))
+            if extra_note:
+                ind.note_list.append(extra_note)
+            nogen_created.append(ind)
+            all_by_id[ind.id] = ind
+            return ind
+
+        def _fam_surname(fam: Family | None) -> str:
+            if fam is None:
+                return ""
+            for sid in (fam.husband_id, fam.wife_id):
+                s = all_by_id.get(sid) if sid else None
+                if s and s.surname:
+                    return s.surname.upper()
+            return ""
+
+        def _marriage_family(wife: Individual, husband: Individual | None) -> Family:
+            nonlocal _fam_counter
+            for fam in families:
+                if fam.wife_id == wife.id:
+                    if husband is not None and fam.husband_id is None:
+                        fam.husband_id = husband.id
+                    return fam
+            # Complete a husband-only parent family — children recorded with an
+            # unnamed mother (e.g. Alfred Ernest Luke's daughter Lillian, whose
+            # mother column is "?") — with the wife the compact chart pairs him
+            # with, rather than splitting his marriage across two families.
+            if husband is not None:
+                for fam in families:
+                    if (fam.husband_id == husband.id and fam.wife_id is None
+                            and fam.child_ids):
+                        fam.wife_id = wife.id
+                        return fam
+            _fam_counter += 1
+            fam = Family(id=f"F{_fam_counter}",
+                         husband_id=husband.id if husband else None,
+                         wife_id=wife.id)
+            families.append(fam)
+            return fam
+
+        # State carried down the compact chart.
+        cur_family: Family | None = None     # couple whose plain no-gen kids attach
+        cur_head: Individual | None = None    # a male head awaiting his own children
+        parent_family: Family | None = None   # sibling-group parents (married-daughter)
+        pending: Individual | None = None     # a deferred plain no-gen row
+        pending_surname = ""
+        pending_nameless = False
+        prev_ind: Individual | None = None
+        prev_surname = ""
+        prev_nee = False
+
+        def _flush() -> None:
+            """Place a deferred plain no-gen row as a child of the current couple."""
+            nonlocal pending, pending_surname, pending_nameless, cur_family, _fam_counter
+            if pending is None:
+                return
+            fam = cur_family
+            if fam is None and cur_head is not None:
+                _fam_counter += 1
+                fam = Family(id=f"F{_fam_counter}", husband_id=cur_head.id)
+                families.append(fam)
+                cur_family = fam
+            if fam is not None:
+                fam.child_ids.append(pending.id)
+                if pending_nameless:
+                    pending.note_list.append(
+                        "Recorded in the source as an unnamed child of this family.")
+            pending = None
+            pending_surname = ""
+            pending_nameless = False
+
+        def _claim_husband(married_surname: str) -> Individual | None:
+            """A née-female's husband is the row immediately above with the same
+            (married) surname — either the deferred no-gen row or the previous
+            bloodline person."""
+            nonlocal pending, pending_surname, pending_nameless
+            if married_surname in ("", "?"):
+                return None
+            if pending is not None and pending_surname == married_surname:
+                h = pending
+                if pending_nameless:
+                    h.note_list.append("Recorded in the source as an unnamed spouse.")
+                pending = None
+                pending_surname = ""
+                pending_nameless = False
+                return h
+            if (prev_ind is not None and prev_surname == married_surname
+                    and not prev_nee):
+                return prev_ind
+            return None
+
+        for r in range(DATA_START_ROW, ws.nrows):
+            code = str(v(r, _C_CODE)).strip().replace("|", "/")
+            surname_raw = str(v(r, _C_SURNAME)).strip()
+            given_raw = str(v(r, _C_GIVEN)).strip()
+            if fv(r) == "M" or (not surname_raw and not given_raw and not code):
+                continue
+            if code:
+                # Coded rows are Pass 3's work; they also break a compact block.
+                _flush()
+                cur_family = cur_head = parent_family = None
+                prev_ind, prev_surname, prev_nee = None, "", False
+                continue
+
+            is_gen = v(r, _C_GENERATION) != ""
+            surname_base = _strip_nee(surname_raw)
+            maiden = _maiden_name(surname_raw)
+            is_nee = bool(maiden) or "née" in surname_raw.lower()
+            given, _ann, _nick = _clean_given(given_raw)
+            nameless = given in ("", "?")
+            married_up = surname_base.upper()
+
+            if is_gen:
+                ind = row_to_ind.get(r)
+                if ind is None:
+                    continue
+                if is_nee:
+                    husband = _claim_husband(married_up)
+                    if husband is None:
+                        _flush()
+                    cur_family = _marriage_family(ind, husband)
+                    cur_head = None
+                else:
+                    _flush()
+                    cur_head = ind if ind.sex != "F" else None
+                    cur_family = None
+                famc = child_to_fam.get(ind.id)
+                if famc is not None:
+                    parent_family = famc
+                prev_ind, prev_surname, prev_nee = ind, married_up, is_nee
+                continue
+
+            # --- no-generation row ---
+            if is_nee:
+                # A married daughter: file under her maiden (or married) surname,
+                # pair a husband if the row above matches her married surname, and
+                # attach her to whichever known family matches her maiden name.
+                surname = (surname_base if surname_base not in ("", "?")
+                           else (maiden or "?").upper())
+                ind = _new_ind("[Unnamed]" if nameless else given, surname, r)
+                husband = _claim_husband(married_up)
+                if husband is None:
+                    _flush()
+                if husband is not None:
+                    _marriage_family(ind, husband)
+                maiden_up = (maiden or "").upper()
+                if parent_family is not None and _fam_surname(parent_family) == maiden_up:
+                    target = parent_family
+                elif cur_family is not None and _fam_surname(cur_family) == maiden_up:
+                    target = cur_family
+                else:
+                    target = parent_family or cur_family
+                if target is not None:
+                    target.child_ids.append(ind.id)
+                if surname_base in ("", "?"):
+                    ind.note_list.append(
+                        "Recorded as a married daughter; her married surname is "
+                        "not given in the source.")
+                elif nameless:
+                    ind.note_list.append(
+                        "Recorded in the source without a given name.")
+                prev_ind, prev_surname, prev_nee = ind, married_up, True
+            else:
+                # A plain no-gen row: defer one step so a following née-female can
+                # claim it as her husband; otherwise it is a child of the couple.
+                _flush()
+                pending = _new_ind("[Unnamed]" if nameless else given,
+                                   surname_base or "?", r)
+                pending_surname = married_up
+                pending_nameless = nameless
+        _flush()
+
+        # Pair any still-orphaned married-in spouse (a gen Sp row in no family) to
+        # a née-woman whose recorded successive married surnames name his surname —
+        # e.g. George Hartely is Lorna Kerslake's second husband ("NAGLE then
+        # HARTLEY"), listed far from her among her descendants, so adjacency cannot
+        # reach him. A one-edit Damerau distance tolerates the source's spelling
+        # wobble (HARTELY/HARTLEY) without risking a loose match.
+        in_family = {sid for fam in families
+                     for sid in (fam.husband_id, fam.wife_id) if sid}
+        in_family |= {c for fam in families for c in fam.child_ids}
+        married_women = [w for w in dedup_map.values() if w.married_surnames]
+        for prow in person_rows:
+            if prow.get("marker") != "Sp":
+                continue
+            ind = dedup_map[prow["dedup_key"]]
+            if ind.id in in_family:
+                continue
+            sb = (ind.surname or "").upper()
+            if not sb:
+                continue
+            match = next(
+                (w for w in married_women
+                 if any(_similar_surname(sb, ms.upper()) for ms in w.married_surnames)),
+                None,
+            )
+            if match is None:
+                continue
+            _fam_counter += 1
+            families.append(Family(id=f"F{_fam_counter}",
+                                   husband_id=ind.id, wife_id=match.id))
+            in_family.add(ind.id)
+
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.
     seen_ids: set[str] = set()
     ordered: list[Individual] = []
-    for ind in list(dedup_map.values()) + list(synth_by_name.values()) + block_created:
+    for ind in (list(dedup_map.values()) + list(synth_by_name.values())
+                + block_created + nogen_created):
         if ind.id not in seen_ids:
             seen_ids.add(ind.id)
             ordered.append(ind)
