@@ -211,7 +211,6 @@ def test_intermediate_spouse_is_spouse_not_child(parsed):
     """An '.../X-Y' code is a married-in spouse of a deep family, not a child of
     the top ancestor."""
     individuals, families = parsed
-    by_id = {i.id: i for i in individuals}
 
     daphne = _one(individuals, "Daphne Edith", "FAULK")
     arthur = _one(individuals, "Arthur Silas", "FAULK")
@@ -386,7 +385,6 @@ def test_prior_marriage_chain_builds_own_family(parsed):
     head his own family with Ada (sexed male), not become Jesse Green's wife
     with an impossible post-mortem marriage date."""
     individuals, families = parsed
-    by_id = {i.id: i for i in individuals}
 
     george = next(i for i in individuals
                   if i.given_name == "George"
@@ -417,7 +415,6 @@ def test_remarried_husband_keeps_each_wifes_own_marriage_date(parsed):
     overwrite his first wife Maud's own row date (1881). The earlier bug also
     produced a marriage dated after Maud's 1882 death."""
     individuals, families = parsed
-    by_id = {i.id: i for i in individuals}
 
     henry = _one(individuals, "Henry George", "PONTING")
     maud = _one(individuals, "Maud", "PONTING")

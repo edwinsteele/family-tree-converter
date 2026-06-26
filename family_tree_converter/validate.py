@@ -92,9 +92,13 @@ def validate(
                 continue
             sb, sd = _year(s.birth_date), _year(s.death_date)
             if sb and my < sb:
-                errors.append(f"{f.id}: marriage {f.marriage_date} before {name(sid)} born {s.birth_date}")
+                errors.append(
+                    f"{f.id}: marriage {f.marriage_date} before "
+                    f"{name(sid)} born {s.birth_date}")
             if sd and my > sd:
-                errors.append(f"{f.id}: marriage {f.marriage_date} after {name(sid)} died {s.death_date}")
+                errors.append(
+                    f"{f.id}: marriage {f.marriage_date} after "
+                    f"{name(sid)} died {s.death_date}")
         for sid, role in ((f.husband_id, "father"), (f.wife_id, "mother")):
             s = by_id.get(sid)
             pb = _year(s.birth_date) if s else None
@@ -106,7 +110,9 @@ def validate(
                     continue
                 age = cb - pb
                 if age < 0:
-                    errors.append(f"{name(c)} born {by_id[c].birth_date} before {role} {name(sid)} ({s.birth_date})")
+                    errors.append(
+                        f"{name(c)} born {by_id[c].birth_date} before "
+                        f"{role} {name(sid)} ({s.birth_date})")
                 elif age < 13 or age > 60:
                     warnings.append(f"{name(sid)} was {age} when {role} of {name(c)}")
 

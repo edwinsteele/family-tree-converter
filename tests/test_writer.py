@@ -1,7 +1,5 @@
 """Tests for GEDCOM writer output."""
 
-from pathlib import Path
-
 import pytest
 
 from family_tree_converter.reader import (
