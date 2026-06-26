@@ -2236,6 +2236,38 @@ def read_spreadsheet(
                                    husband_id=ind.id, wife_id=match.id))
             in_family.add(ind.id)
 
+        # Per-person marriage details attach to the name-linked families built
+        # above. The earlier per-person pass ran before these families existed and
+        # only indexed coded husband/wife rows, so a name-linked couple whose
+        # marriage sits on their own rows rather than on a separate 'M'-flag row
+        # would lose it (e.g. Henry Joseph Costigan + Jane Steel, married 1871, or
+        # most of the deep Bruce/Steel couples whose dates are per-person). Index
+        # every person row by spouse id and fill any family still lacking a
+        # marriage, preferring the spouse in the fewest families so a remarriage's
+        # single recorded date cannot leak across both of their marriages.
+        row_marr2: dict[str, dict] = {}
+        for prow in person_rows:
+            if not (prow["marr_date"] or prow["marr_place"]):
+                continue
+            row_marr2.setdefault(dedup_map[prow["dedup_key"]].id, prow)
+        if row_marr2:
+            fam_count: dict[str, int] = {}
+            for fam in families:
+                for sid in (fam.husband_id, fam.wife_id):
+                    if sid:
+                        fam_count[sid] = fam_count.get(sid, 0) + 1
+            for fam in families:
+                if fam.marriage_date or fam.marriage_place:
+                    continue
+                cands = [s for s in (fam.husband_id, fam.wife_id)
+                         if s and s in row_marr2]
+                cands.sort(key=lambda s: (fam_count.get(s, 0),
+                                          0 if s == fam.husband_id else 1))
+                if cands:
+                    src = row_marr2[cands[0]]
+                    fam.marriage_date = src["marr_date"]
+                    fam.marriage_place = src["marr_place"]
+
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.
     seen_ids: set[str] = set()

@@ -132,6 +132,18 @@ def test_impossible_death_demoted_to_note(parsed):
                for n in annie.note_list)
 
 
+def test_per_person_marriage_attaches_to_name_linked_family(parsed):
+    # Most couples record their marriage on each spouse's own row (col 35), not on
+    # a separate 'M'-flag row. Those dates must attach to the name-linked family —
+    # e.g. Henry Joseph Costigan married Jane (née Steel) in 1871, recorded only
+    # per-person. (Regression: the per-person attach used to skip role-"unknown"
+    # rows, so every no-code couple without an 'M' row lost its marriage.)
+    individuals, families = parsed
+    henry = next(i for i in _find(individuals, "Henry Joseph", "COSTIGAN"))
+    fam = next(f for f in families if f.husband_id == henry.id)
+    assert fam.marriage_date == "20 OCT 1871"
+
+
 def test_marginal_annotation_row_excluded(parsed):
     # A generation-numbered "{2nd wife - ??}" placeholder is marginalia, not a
     # person — it must not become an individual.
