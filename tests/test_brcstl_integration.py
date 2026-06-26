@@ -144,6 +144,17 @@ def test_per_person_marriage_attaches_to_name_linked_family(parsed):
     assert fam.marriage_date == "20 OCT 1871"
 
 
+def test_approximate_year_dates_are_valid_gedcom(parsed):
+    # "early 1869" (a specific year, not a decade) must become the bare year, and
+    # a decade range "1940s/1950s" must become a BET span — not leak verbatim as
+    # a non-conformant GEDCOM date.
+    individuals, families = parsed
+    george = _find(individuals, "George Alexander", "STEELE")[0]
+    assert george.birth_date == "1869"
+    percy = _find(individuals, "Percy", "CRANE")[0]
+    assert percy.death_date == "BET 1940 AND 1959"
+
+
 def test_marginal_annotation_row_excluded(parsed):
     # A generation-numbered "{2nd wife - ??}" placeholder is marginalia, not a
     # person — it must not become an individual.

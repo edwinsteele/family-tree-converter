@@ -349,6 +349,18 @@ def _parse_approx_string(s: str) -> str | None:
             return f"{int(m.group(1))} {mon} {m.group(3)}"
         return f"{mon} {m.group(3)}"
 
+    # Decade *range* "1940s/1950s" → "BET 1940 AND 1959" (spans both decades).
+    m = re.match(r"^(\d{3})0s?\s*/\s*(\d{3})0s?$", normalised)
+    if m:
+        return f"BET {int(m.group(1)) * 10} AND {int(m.group(2)) * 10 + 9}"
+
+    # "early/mid/late YYYY" with a *specific* year (not a decade, handled above):
+    # the year is certain, the qualifier only narrows within it, which GEDCOM
+    # cannot express — so emit the bare year ("early 1869" → "1869").
+    m = re.match(r"^(?:early|mid|late)\s+(\d{4})$", normalised)
+    if m:
+        return m.group(1)
+
     return s  # pass through unchanged; writer will emit as-is
 
 
