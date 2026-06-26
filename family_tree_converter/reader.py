@@ -89,6 +89,12 @@ class FormatProfile:
     # later generations are recorded without codes. Off for the fully-coded
     # reference/C&A files so their output is unchanged.
     name_link_uncoded: bool = False
+    # Last data row + 1 (exclusive end). None means read to the sheet end. Set it
+    # to stop before a trailing appendix that is not part of the tree — e.g.
+    # Brc:Stl ends with a block of speculative "alternative" candidate rows
+    # ("BELOW ARE ALTERNATIVES FOR JANE THOMSON", "IS THIS A GOER?") that must
+    # not become individuals.
+    data_end_row: int | None = None
 
 
 # The reference layout, built from the module constants so the two never drift.
@@ -143,11 +149,38 @@ HCKS_PROFILE = FormatProfile(
     name_link_uncoded=True,  # half the rows are coded; the rest link by name
 )
 
+# "Brc:Stl H.Tree #46" — the Steele line's Scottish (Bruce/Steel) ancestry, drawn
+# as a descending horizontal tree with NO path codes at all: every person is
+# generation-numbered (col 4, counting *down* 11→0 from the oldest ancestor) and
+# names their parents in the Father/Mother columns, so the whole file links by
+# name (Pass 4b/6) the way the later, uncoded generations of Hcks do. There is a
+# real SURNAME column (col 22, with "[née X]"), a B/Sp role marker (col 19;
+# B = bloodline, Sp = married-in spouse) and an X "appears as both child and head"
+# marker (col 18) — the X-row and the following non-X row are the same person and
+# dedup to one individual. Marriage is recorded both on rarer 'M'-flag rows and
+# per-person (cols 35/36). col 15 is empty throughout, so it doubles as the
+# (unused) code column. The file ends with a speculative "alternatives" appendix
+# (rows 181+) excluded via data_end_row. Map derived from the file's own row-20
+# header legend.
+BRCSTL_PROFILE = FormatProfile(
+    name="Brc:Stl",
+    data_start_row=21,
+    generation=4, code=15, father=20, mother=21, surname=22, given=23,
+    date1=24, flag=25, town=26, county=27, death_date=30, buried=31,
+    longevity=33, marriage=35, married_place=36, occupation=37, notes=38,
+    line_first=999,  # no lineage-membership columns
+    marker=19,  # col 19: B (bloodline) / Sp (married-in spouse)
+    code_convention="none",  # no path codes; link by generation + parent names
+    name_link_uncoded=True,
+    data_end_row=181,  # rows 181+ are a speculative "alternatives" appendix
+)
+
 # Registry of known per-file profiles, keyed by a substring of the file name.
 PROFILES: dict[str, FormatProfile] = {
     "BlsGrnLivMcCl": BLSGRN_PROFILE,
     "C & A Stl": CASTL_PROFILE,
     "Hcks:Thos:Krsl": HCKS_PROFILE,
+    "Brc:Stl": BRCSTL_PROFILE,
 }
 
 
@@ -405,6 +438,37 @@ def _longevity_discrepancy_note(
         f"between the recorded birth and death dates — one of these is "
         f"likely a transcription error."
     )
+
+
+def _impossible_death_note(
+    birth: str | None, death: str | None, death_place: str | None
+) -> str | None:
+    """When the recorded death year precedes the recorded birth year the source
+    has an outright contradiction (e.g. Brc:Stl's Mary Ann Costigan, born 1917
+    but with a death recorded as 1904). Emitting that as a structured death event
+    asserts an impossibility that conformant readers reject, so the caller drops
+    the death event and keeps this verbatim note instead — preserving the figure
+    without inventing a correction, per the project's preserve-don't-assert rule.
+    Returns None unless both dates carry a concrete year and death < birth."""
+    if not birth or not death:
+        return None
+    bm = re.search(r"\b(\d{4})\b", birth)
+    dm = re.search(r"\b(\d{4})\b", death)
+    if not (bm and dm) or int(dm.group(1)) >= int(bm.group(1)):
+        return None
+    where = f" at {death_place}" if death_place else ""
+    return (
+        f'Source records a death date of "{death}"{where}, which precedes the '
+        f'recorded birth — retained here as a note rather than a (chronologically '
+        f"impossible) death event."
+    )
+
+
+def _is_marriage_label(s: str) -> bool:
+    """A "<X> married <Y>" cell is a marriage row, even when its 'M' flag is
+    missing (e.g. Brc:Stl's Henry-Steel/Agnes-Anderson row). Used only by the
+    no-code files so it can never reclassify a real person row elsewhere."""
+    return bool(re.search(r"\bmarried\b", s, re.IGNORECASE))
 
 
 def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
@@ -720,6 +784,7 @@ def read_spreadsheet(
     # reference profile these equal the module constants, so output is unchanged.
     p = profile
     DATA_START_ROW = p.data_start_row
+    DATA_END_ROW = ws.nrows if p.data_end_row is None else p.data_end_row
     _C_GENERATION, _C_CODE, _C_FATHER, _C_MOTHER = (
         p.generation, p.code, p.father, p.mother)
     _C_SURNAME, _C_GIVEN, _C_DATE1, _C_FLAG = (
@@ -798,7 +863,7 @@ def read_spreadsheet(
     # person code. Only enabled for files that use the alpha-code convention.
     all_codes: set[str] = set()
     if p.code_convention == "alpha":
-        for r in range(DATA_START_ROW, ws.nrows):
+        for r in range(DATA_START_ROW, DATA_END_ROW):
             c = str(v(r, _C_CODE)).strip().replace("|", "/")
             if c:
                 all_codes.add(c)
@@ -840,6 +905,11 @@ def read_spreadsheet(
         given = str(v(r, _C_GIVEN)).strip()
         if flag == "M":
             return "marriage"
+        # A no-code file can carry a generation-numbered marginal annotation with
+        # no real name (e.g. Brc:Stl's "{2nd wife - ??}") — layout, not a person.
+        if (profile.code_convention == "none" and not _strip_nee(surname)
+                and bool(re.fullmatch(r"\{.*\}", given))):
+            return "blank/layout"
         if _is_person_row(r, code, generation):
             return "coded-person" if code else "gen-person"
         if flag in ("B", "D") and surname:
@@ -858,7 +928,7 @@ def read_spreadsheet(
         diag.setdefault("placeholder_ids", set())
         diag.setdefault("generation_by_id", {})
         diag.setdefault("name_linked_family_ids", set())
-        for r in range(DATA_START_ROW, ws.nrows):
+        for r in range(DATA_START_ROW, DATA_END_ROW):
             diag["row_class"][r] = _classify_row(r)
             surname = str(v(r, _C_SURNAME)).strip()
             given = str(v(r, _C_GIVEN)).strip()
@@ -876,12 +946,19 @@ def read_spreadsheet(
     loose_child_rows: list[tuple[int, str, str | None]] = []
     last_child_base: str | None = None
 
-    for r in range(DATA_START_ROW, ws.nrows):
+    for r in range(DATA_START_ROW, DATA_END_ROW):
         flag = fv(r)
         generation = v(r, _C_GENERATION)
         code = str(v(r, _C_CODE)).strip().replace("|", "/")
+        # No-code files (Brc:Stl) carry a few marriage rows that lack the 'M'
+        # flag; recognise them by the "<X> married <Y>" text so they neither
+        # become a person nor are mistaken for a loose given-name-only child.
+        is_marr = flag == "M" or (
+            p.code_convention == "none"
+            and _is_marriage_label(str(v(r, _C_GIVEN)))
+        )
 
-        if flag == "M":
+        if is_marr:
             combined = str(v(r, _C_GIVEN)).strip()
             marr_notes = list(row_notes.get(r, []))
             mn = _date_precision_note(v(r, _C_DATE1), "Marriage")
@@ -896,6 +973,11 @@ def read_spreadsheet(
             })
         elif _is_person_row(r, code, generation):
             surname = str(v(r, _C_SURNAME)).strip()
+            # A generation-numbered marginal annotation with no real name (e.g.
+            # Brc:Stl's "{2nd wife - ??}" placeholder) is not an individual.
+            if (profile.code_convention == "none" and not _strip_nee(surname)
+                    and re.fullmatch(r"\{.*\}", str(v(r, _C_GIVEN)).strip())):
+                continue
             given, given_annotation, nickname = _clean_given(str(v(r, _C_GIVEN)).strip())
             father = str(v(r, _C_FATHER)).strip()
             surname_base = _strip_nee(surname)
@@ -915,11 +997,18 @@ def read_spreadsheet(
                 pn = _date_precision_note(v(r, cell), lbl)
                 if pn:
                     person_notes.append(pn)
-            ld = _longevity_discrepancy_note(
-                _parse_date(v(r, _C_DATE1)), _parse_date(v(r, _C_DEATH_DATE)),
-                _longevity(r))
+            birth_date = _parse_date(v(r, _C_DATE1))
+            death_date = _parse_date(v(r, _C_DEATH_DATE))
+            death_place = _standardise_place(str(v(r, _C_BURIED)).strip()) or None
+            ld = _longevity_discrepancy_note(birth_date, death_date, _longevity(r))
             if ld:
                 person_notes.append(ld)
+            # A death recorded before the birth is a source contradiction; keep
+            # the figure as a note and drop the impossible structured event.
+            idn = _impossible_death_note(birth_date, death_date, death_place)
+            if idn:
+                person_notes.append(idn)
+                death_date = death_place = None
 
             role, base = _classify_code(code)
             person_rows.append({
@@ -935,11 +1024,11 @@ def read_spreadsheet(
                 "given": given,
                 "nickname": nickname,
                 "marker": marker,
-                "birth_date": _parse_date(v(r, _C_DATE1)),
+                "birth_date": birth_date,
                 "birth_is_chr": flag == "C",
                 "birth_place": _birth_place(r),
-                "death_date": _parse_date(v(r, _C_DEATH_DATE)),
-                "death_place": _standardise_place(str(v(r, _C_BURIED)).strip()) or None,
+                "death_date": death_date,
+                "death_place": death_place,
                 # Marriage date/place are recorded on each spouse's own row
                 # (cols 31/32), not only on the rarer 'M'-flag rows.
                 "marr_date": _parse_date(v(r, _C_MARRIAGE)),
@@ -1560,6 +1649,31 @@ def read_spreadsheet(
             up = [c for c in cands if gen_by_id.get(c) == child_gen + 1]
             return uncoded_ind_by_id.get(up[0]) if len(up) == 1 else None
 
+        def _gen_variant_match(
+            parsed: tuple[str | None, str | None] | None, child_gen: float | None
+        ) -> Individual | None:
+            """Resolve a parent whose surname the source spells slightly
+            differently from the parent's own row, using the generation to pick.
+
+            Brc:Stl charts the Scottish ancestors as "STEEL" but their Australian
+            descendants (and the parent references in those rows) as "STEELE", so
+            James Steel b.1829's children name their father "James Steele" and the
+            exact-surname index misses him — leaving them to mint a fresh synthetic
+            or wrongly attach to his same-named son (b.1861). Gather candidates
+            across the exact surname *and* any one-edit spelling variant present in
+            the index, then accept the single one that sits exactly one generation
+            above the child. Only used by the no-code files."""
+            if not parsed or not parsed[0] or child_gen is None or not parsed[1]:
+                return None
+            token = _first_word(parsed[0])
+            target_sn = parsed[1].upper()
+            cands: set[str] = set()
+            for (sn, tk), owners in token_owners.items():
+                if tk == token and _similar_surname(sn, target_sn):
+                    cands |= owners
+            up = [c for c in cands if gen_by_id.get(c) == child_gen + 1]
+            return uncoded_ind_by_id.get(up[0]) if len(up) == 1 else None
+
         def _parent_family_uncoded(pkey: tuple[str | None, str | None]) -> Family:
             """Family for a name-linked child's parents, reusing one a path code
             already built for the same couple so children don't spawn a phantom
@@ -1596,11 +1710,16 @@ def read_spreadsheet(
                 continue
             child_gen = gen_by_id.get(ind.id)
             avoid = frozenset(_descendants(ind.id) | {ind.id})
-            father_ind = (_gen_disambig(fp, child_gen)
-                          or _resolve_parent(fp, "M", avoid, ind.birth_date))
-            mother_ind = (_gen_disambig(mp, child_gen)
-                          or _resolve_parent(mp, "F", avoid, ind.birth_date,
-                                             co_parent=father_ind))
+            spell_tolerant = profile.code_convention == "none"
+            father_ind = (
+                _gen_disambig(fp, child_gen)
+                or (_gen_variant_match(fp, child_gen) if spell_tolerant else None)
+                or _resolve_parent(fp, "M", avoid, ind.birth_date))
+            mother_ind = (
+                _gen_disambig(mp, child_gen)
+                or (_gen_variant_match(mp, child_gen) if spell_tolerant else None)
+                or _resolve_parent(mp, "F", avoid, ind.birth_date,
+                                   co_parent=father_ind))
             if father_ind is None and mother_ind is None:
                 continue
             pkey = (father_ind.id if father_ind else None,
@@ -1646,7 +1765,7 @@ def read_spreadsheet(
 
     block_people: dict[tuple, dict] = {}
     block_order: list[tuple] = []
-    for r in range(DATA_START_ROW, ws.nrows):
+    for r in range(DATA_START_ROW, DATA_END_ROW):
         if fv(r) not in ("B", "D"):
             continue
         if v(r, _C_GENERATION) != "":
@@ -2000,11 +2119,14 @@ def read_spreadsheet(
                 return prev_ind
             return None
 
-        for r in range(DATA_START_ROW, ws.nrows):
+        for r in range(DATA_START_ROW, DATA_END_ROW):
             code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_raw = str(v(r, _C_SURNAME)).strip()
             given_raw = str(v(r, _C_GIVEN)).strip()
-            if fv(r) == "M" or (not surname_raw and not given_raw and not code):
+            if (fv(r) == "M"
+                    or (profile.code_convention == "none"
+                        and _is_marriage_label(given_raw))
+                    or (not surname_raw and not given_raw and not code)):
                 continue
             if code:
                 # Coded rows are Pass 3's work; they also break a compact block.
