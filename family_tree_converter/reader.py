@@ -76,6 +76,11 @@ class FormatProfile:
     # files it holds Sp=married-in spouse, X=appears as both sibling and married.
     # None when the file has no such column.
     marker: int | None = None
+    # A second status-marker column, when the file splits the roles across two
+    # columns — J&DJ Steele keeps Sp (married-in) in col 13 but Dv (divorced) in
+    # col 11. Holds Dv / Df / Tw; merged with ``marker`` at read time. None when
+    # the file carries every status in the single ``marker`` column.
+    status_marker: int | None = None
     # Columns whose Excel cell comments are "not for publication" and must be
     # excluded from the harvested notes. Empty when the file has no such column.
     private_note_cols: tuple[int, ...] = ()
@@ -95,6 +100,15 @@ class FormatProfile:
     # ("BELOW ARE ALTERNATIVES FOR JANE THOMSON", "IS THIS A GOER?") that must
     # not become individuals.
     data_end_row: int | None = None
+    # Mid-file row ranges to exclude entirely, as (start, end-exclusive) pairs.
+    # Unlike ``data_end_row`` these sit *between* valid regions, so a trailing cut
+    # cannot express them — e.g. J&DJ Steele records a block of 13 PRICE entries
+    # the genealogist explicitly disavowed ("The following 13 entries are now
+    # known to have nothing to do with ... family.") followed by blank rows and a
+    # second embedded header, with the real PRICE in-married family beginning
+    # afterwards. The range covers the disavowal note, the disavowed entries, the
+    # blanks, and the embedded header in one span.
+    skip_rows: tuple[tuple[int, int], ...] = ()
 
 
 # The reference layout, built from the module constants so the two never drift.
@@ -175,12 +189,45 @@ BRCSTL_PROFILE = FormatProfile(
     data_end_row=181,  # rows 181+ are a speculative "alternatives" appendix
 )
 
+# "J & D J Steele H.Tree #30" — another Steele branch, drawn like Brc:Stl with NO
+# path codes: every person in the main tree (rows 14-178) is generation-numbered
+# (col 4) and names their parents in the Father/Mother columns, so the file links
+# by name (Pass 4b). col 13 carries the Sp marker (married-in spouse); col 19 is
+# the B/C/M date-type flag (here only 'B' birth and one 'M' marriage row). col 15
+# is empty throughout, so it doubles as the (unused) code column. The file ends
+# with a separate, *legitimate* in-married PRICE family block (rows 185-209) under
+# its own embedded header (rows 183-184): John Price + Mary Muldoon and their
+# 22 children, listed as B-flag event rows under a single 'M' marriage row, with
+# the children grouped by position (they name no parents). Dorothy Jane Price in
+# that block is the same person as the née-Price spouse at row 15. Map derived
+# from the file's own row-13 header legend.
+JDJSTEELE_PROFILE = FormatProfile(
+    name="J & D J Steele",
+    data_start_row=14,
+    # col 5 is empty throughout the data, so it serves as the (unused) code
+    # column — note col 15 here is the *Mother* column, NOT empty (unlike
+    # Brc:Stl, where col 15 was the spare). Father/Mother are cols 14/15.
+    generation=4, code=5, father=14, mother=15, surname=16, given=17,
+    date1=18, flag=19, town=20, county=21, death_date=24, buried=25,
+    longevity=27, marriage=29, married_place=30, occupation=31, notes=32,
+    line_first=999,  # no lineage-membership columns
+    marker=13,  # col 13: Sp (married-in spouse)
+    status_marker=11,  # col 11: Dv (this marriage ended in divorce)
+    code_convention="none",  # no path codes; link by generation + parent names
+    name_link_uncoded=True,
+    # Rows 165-184: the disavowal note, the 13 disavowed PRICE entries the
+    # genealogist later found unrelated, the trailing blanks, and the embedded
+    # second header — all excluded so only the real PRICE block (185+) is read.
+    skip_rows=((165, 185),),
+)
+
 # Registry of known per-file profiles, keyed by a substring of the file name.
 PROFILES: dict[str, FormatProfile] = {
     "BlsGrnLivMcCl": BLSGRN_PROFILE,
     "C & A Stl": CASTL_PROFILE,
     "Hcks:Thos:Krsl": HCKS_PROFILE,
     "Brc:Stl": BRCSTL_PROFILE,
+    "J & D J Steele": JDJSTEELE_PROFILE,
 }
 
 
@@ -285,6 +332,13 @@ def _parse_approx_string(s: str) -> str | None:
             return f"BET {base + 6} AND {base + 9}"
         # bare "1900s"
         return f"BET {base} AND {base + 9}"
+
+    # "1931/2/3" → year-first numeric date (Y/M/D), → "3 FEB 1931".
+    m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s.strip())
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{day} {_MONTHS[month - 1]} {year}"
 
     # "1930/1", "1831/2" → uncertain year, convert to BET range
     m = re.match(r"^(\d{4})/\d{1,2}$", s.strip())
@@ -496,7 +550,11 @@ def _parse_parent_name(raw: str) -> tuple[str | None, str | None] | None:
         '?'             → None
         'Harry(?)'      → ('Harry', None)
     """
-    # Strip a parenthetical uncertainty marker that leaks into the name.
+    # Strip editorial annotations that are not part of a real ancestor's name:
+    # a parenthetical uncertainty marker, and a square-bracket tag such as
+    # "[Adopted]" (a child recorded as adopted names no real parent — treating
+    # "[Adopted]" as a surname otherwise builds a bogus self-married family).
+    raw = re.sub(r"\s*\[.*?\]", "", raw)
     raw = re.sub(r"\s*\(\s*\?\s*\)", "", raw)
     s = " ".join(raw.split())
     if not s or s == "?":
@@ -797,6 +855,8 @@ def read_spreadsheet(
     p = profile
     DATA_START_ROW = p.data_start_row
     DATA_END_ROW = ws.nrows if p.data_end_row is None else p.data_end_row
+    # Mid-file rows to exclude entirely (disavowed appendices, embedded headers).
+    _excluded_rows = {r for a, b in p.skip_rows for r in range(a, b)}
     _C_GENERATION, _C_CODE, _C_FATHER, _C_MOTHER = (
         p.generation, p.code, p.father, p.mother)
     _C_SURNAME, _C_GIVEN, _C_DATE1, _C_FLAG = (
@@ -808,6 +868,7 @@ def read_spreadsheet(
     _C_OCCUPATION, _C_NOTES, _C_LINE_FIRST = (
         p.occupation, p.notes, p.line_first)
     _C_MARKER = p.marker
+    _C_STATUS = p.status_marker
 
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
@@ -827,8 +888,13 @@ def read_spreadsheet(
         return v(r, _C_LONGEVITY) if _C_LONGEVITY is not None else ""
 
     def mv(r: int) -> str:
-        """Per-person status marker (Dv/Df/Tw), or '' when no marker column."""
+        """Per-person role/status marker (Sp/Dv/Df/Tw), or '' when no column."""
         return "" if _C_MARKER is None else str(v(r, _C_MARKER)).strip()
+
+    def smv(r: int) -> str:
+        """Secondary status marker (Dv/Df/Tw) when the file splits it into its
+        own column, or '' when there is no such column."""
+        return "" if _C_STATUS is None else str(v(r, _C_STATUS)).strip()
 
     def _is_person_row(r: int, code: str, generation: Any) -> bool:
         """A data row describes an individual. Most files number the generation
@@ -941,6 +1007,8 @@ def read_spreadsheet(
         diag.setdefault("generation_by_id", {})
         diag.setdefault("name_linked_family_ids", set())
         for r in range(DATA_START_ROW, DATA_END_ROW):
+            if r in _excluded_rows:
+                continue
             diag["row_class"][r] = _classify_row(r)
             surname = str(v(r, _C_SURNAME)).strip()
             given = str(v(r, _C_GIVEN)).strip()
@@ -959,6 +1027,8 @@ def read_spreadsheet(
     last_child_base: str | None = None
 
     for r in range(DATA_START_ROW, DATA_END_ROW):
+        if r in _excluded_rows:
+            continue
         flag = fv(r)
         generation = v(r, _C_GENERATION)
         code = str(v(r, _C_CODE)).strip().replace("|", "/")
@@ -994,15 +1064,28 @@ def read_spreadsheet(
             father = str(v(r, _C_FATHER)).strip()
             surname_base = _strip_nee(surname)
             marker = mv(r)
+            status = smv(r)  # secondary Dv/Df/Tw column, when the file has one
+            all_markers = {marker, status}
 
             person_notes = list(row_notes.get(r, []))
             if given_annotation:
                 person_notes.append(f"Name annotation: [{given_annotation}].")
+            # A parent column holding only an editorial tag (e.g. "[Adopted]")
+            # names no real ancestor; the tag is dropped from parent linking, so
+            # preserve its meaning here as a note on the child. Gated to the
+            # no-code files so the fully-coded reference/C&A output is unchanged
+            # (their adopted children are coded and were never mislinked).
+            if profile.name_link_uncoded:
+                for praw in (father, str(v(r, _C_MOTHER)).strip()):
+                    pm = re.fullmatch(r"\[(.+)\]", praw)
+                    note = f'Parentage recorded as "{praw}".'
+                    if pm and note not in person_notes:
+                        person_notes.append(note)
             # Status markers: twin / previously-divorced become NOTEs on the
             # person; 'Dv' (this marriage divorced) is handled at family level.
-            if marker == "Tw":
+            if "Tw" in all_markers:
                 person_notes.append("Recorded as a twin.")
-            elif marker == "Df":
+            elif "Df" in all_markers:
                 person_notes.append("Recorded as previously divorced.")
             for cell, lbl in ((_C_DATE1, "Birth"), (_C_DEATH_DATE, "Death"),
                               (_C_MARRIAGE, "Marriage")):
@@ -1036,6 +1119,7 @@ def read_spreadsheet(
                 "given": given,
                 "nickname": nickname,
                 "marker": marker,
+                "status": status,
                 "birth_date": birth_date,
                 "birth_is_chr": flag == "C",
                 "birth_place": _birth_place(r),
@@ -1363,15 +1447,13 @@ def read_spreadsheet(
             if h.sex == "F":
                 fam.husband_id, fam.wife_id = fam.wife_id, fam.husband_id
 
-    # A 'Dv' status marker sits on a married-in spouse whose code maps to exactly
-    # one family — so mark that family as ended in divorce (emitted as 1 DIV).
+    # A 'Dv' status marker sits on a divorced spouse — its family is marked ended
+    # in divorce (emitted as 1 DIV) in a final sweep below, once the name-linked
+    # families (Pass 4b/6) that some of these spouses head have all been built.
     divorced_spouse_ids = {
         dedup_map[p["dedup_key"]].id
-        for p in person_rows if p.get("marker") == "Dv"
+        for p in person_rows if "Dv" in (p.get("marker"), p.get("status"))
     }
-    for fam in families:
-        if fam.husband_id in divorced_spouse_ids or fam.wife_id in divorced_spouse_ids:
-            fam.divorced = True
 
     # Attach marriage date/place recorded on the spouses' own rows (cols 31/32).
     # The 'M'-flag marriage rows cover only a fraction of couples; the rest
@@ -1555,6 +1637,14 @@ def read_spreadsheet(
                 surnameless_synth.add(parent.id)
                 if co_parent is not None:
                     synth_by_name[("", co_parent.id, key[1])] = parent
+                else:
+                    # No co-parent (the other parent is unknown), so there is no
+                    # shared key to register under — but the record is still
+                    # referenced by the child's family and must reach `ordered`
+                    # or it becomes a dangling pointer. Register under a unique,
+                    # never-matched key so it is emitted without collapsing onto
+                    # another given-only parent.
+                    synth_by_name[("__unlinked__", parent.id)] = parent
         return parent
 
     for _, etype, data in all_events:
@@ -1645,6 +1735,57 @@ def read_spreadsheet(
                 gen_by_id.setdefault(dedup_map[prow["dedup_key"]].id, g)
         uncoded_ind_by_id = {i.id: i for i in dedup_map.values()}
 
+        # All individuals sharing each surname, for the initials-aware matcher.
+        surname_people: dict[str, set[str]] = {}
+        for ind, surnames, _tokens in row_aliases:
+            for sn in surnames:
+                surname_people.setdefault(sn, set()).add(ind.id)
+
+        def _is_initial(tok: str) -> bool:
+            """A single-letter token (with optional dot): 'j', 'j.' — too weak
+            to key a match on, and prone to collide with others' middle initials
+            (the father ref "J. A. Bruce" must not match "Hazel J.")."""
+            return bool(re.fullmatch(r"[a-z]\.?", tok))
+
+        def _given_tokens(g: str | None) -> list[str]:
+            return (g or "").lower().replace("(", " ").replace(")", " ").split()
+
+        def _tok_compat(a: str, b: str) -> bool:
+            """Two given-name tokens are compatible if equal, one is an initial
+            matching the other's first letter ('j.'~'james'), or one is a
+            ≥3-char abbreviation prefix of the other ('fred.'~'frederick')."""
+            a, b = a.rstrip("."), b.rstrip(".")
+            if a == b:
+                return True
+            if len(a) == 1 and b.startswith(a):
+                return True
+            if len(b) == 1 and a.startswith(b):
+                return True
+            return (len(a) >= 3 and b.startswith(a)) or (len(b) >= 3 and a.startswith(b))
+
+        def _initials_match(
+            parsed: tuple[str | None, str | None] | None, child_gen: float | None
+        ) -> Individual | None:
+            """Resolve a parent referenced by initials to their full-name record
+            — e.g. the children of "J. A. Bruce Steele" mean James Alexander
+            Bruce Steele. Among same-surname people one generation up, keep those
+            whose full given name is initial-compatible with the reference, token
+            for token; accept the unique one. No-code files only."""
+            if not parsed or not parsed[0] or child_gen is None or not parsed[1]:
+                return None
+            ref = _given_tokens(parsed[0])
+            if not ref:
+                return None
+            hits = set()
+            for iid in surname_people.get(parsed[1].upper(), set()):
+                if gen_by_id.get(iid) != child_gen + 1:
+                    continue
+                cand = _given_tokens(uncoded_ind_by_id[iid].given_name)
+                if (len(ref) <= len(cand)
+                        and all(_tok_compat(ref[i], cand[i]) for i in range(len(ref)))):
+                    hits.add(iid)
+            return uncoded_ind_by_id.get(next(iter(hits))) if len(hits) == 1 else None
+
         def _gen_disambig(
             parsed: tuple[str | None, str | None] | None, child_gen: float | None
         ) -> Individual | None:
@@ -1655,11 +1796,21 @@ def read_spreadsheet(
             if not parsed or not parsed[0] or child_gen is None or not parsed[1]:
                 return None
             token = _first_word(parsed[0])
+            if _is_initial(token):
+                return None  # an initial is too weak to disambiguate on
             cands = token_owners.get((parsed[1].upper(), token), set())
             if len(cands) <= 1:
                 return None
             up = [c for c in cands if gen_by_id.get(c) == child_gen + 1]
-            return uncoded_ind_by_id.get(up[0]) if len(up) == 1 else None
+            if len(up) == 1:
+                return uncoded_ind_by_id.get(up[0])
+            # Several same-generation candidates: the referenced name collides
+            # with another's *middle* name (e.g. "James Steele" matches both
+            # "James" b.1928 and his brother "Matthew James Bruce"). Prefer the
+            # candidate whose FIRST given word is the referenced name.
+            first = [c for c in up
+                     if _first_word(uncoded_ind_by_id[c].given_name) == token]
+            return uncoded_ind_by_id.get(first[0]) if len(first) == 1 else None
 
         def _gen_variant_match(
             parsed: tuple[str | None, str | None] | None, child_gen: float | None
@@ -1678,6 +1829,8 @@ def read_spreadsheet(
             if not parsed or not parsed[0] or child_gen is None or not parsed[1]:
                 return None
             token = _first_word(parsed[0])
+            if _is_initial(token):
+                return None
             target_sn = parsed[1].upper()
             cands: set[str] = set()
             for (sn, tk), owners in token_owners.items():
@@ -1726,10 +1879,12 @@ def read_spreadsheet(
             father_ind = (
                 _gen_disambig(fp, child_gen)
                 or (_gen_variant_match(fp, child_gen) if spell_tolerant else None)
+                or _initials_match(fp, child_gen)
                 or _resolve_parent(fp, "M", avoid, ind.birth_date))
             mother_ind = (
                 _gen_disambig(mp, child_gen)
                 or (_gen_variant_match(mp, child_gen) if spell_tolerant else None)
+                or _initials_match(mp, child_gen)
                 or _resolve_parent(mp, "F", avoid, ind.birth_date,
                                    co_parent=father_ind))
             if father_ind is None and mother_ind is None:
@@ -1777,7 +1932,22 @@ def read_spreadsheet(
 
     block_people: dict[tuple, dict] = {}
     block_order: list[tuple] = []
+    # A block's marriage row ("John PRICE married Mary MULDOON") establishes the
+    # couple for the children listed after it. Those children carry no parent
+    # names of their own — the genealogist grouped them by position under the
+    # marriage — so they inherit the marriage row's spouses as their parents.
+    # Only the no-code files (which position rather than code) reach this; file
+    # #1's blocks name each child's parents explicitly and never set a section.
+    section_father = section_mother = ""
     for r in range(DATA_START_ROW, DATA_END_ROW):
+        if r in _excluded_rows:
+            continue
+        if profile.name_link_uncoded and fv(r) == "M":
+            parts = re.split(r"\bmarried\b", str(v(r, _C_GIVEN)),
+                             maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                section_father, section_mother = parts[0].strip(), parts[1].strip()
+            continue
         if fv(r) not in ("B", "D"):
             continue
         if v(r, _C_GENERATION) != "":
@@ -1794,6 +1964,12 @@ def read_spreadsheet(
         surname_base = _strip_nee(surname)
         father_raw = str(v(r, _C_FATHER)).strip()
         mother_raw = str(v(r, _C_MOTHER)).strip()
+        # A child listed under a block marriage row names no parents of its own;
+        # adopt that couple so it links to them (and unifies with the synthetic
+        # parents the main tree already implied for them).
+        if (profile.name_link_uncoded and not father_raw and not mother_raw
+                and (section_father or section_mother)):
+            father_raw, mother_raw = section_father, section_mother
         f_first = father_raw.split()[0].lower() if father_raw and father_raw != "?" else "?"
         m_first = mother_raw.split()[0].lower() if mother_raw and mother_raw != "?" else "?"
         # Parents distinguish same-named people (e.g. two different "John"s).
@@ -1802,9 +1978,11 @@ def read_spreadsheet(
         if rec is None:
             rec = {
                 "given": given, "surname_base": surname_base,
+                "maiden": _maiden_name(surname),
                 "nickname": nickname,
                 "father_raw": father_raw, "mother_raw": mother_raw,
-                "birth": None, "death": None, "death_place": None,
+                "birth": None, "birth_place": None,
+                "death": None, "death_place": None,
                 "sex": _infer_sex(surname), "notes": [],
             }
             block_people[key] = rec
@@ -1823,6 +2001,10 @@ def read_spreadsheet(
         date = _parse_date(v(r, _C_DATE1))
         if flag == "B":
             rec["birth"] = rec["birth"] or date
+            # Capture the birth place too — only for the no-code files, so file
+            # #1's existing block output stays byte-identical.
+            if profile.name_link_uncoded and not rec["birth_place"]:
+                rec["birth_place"] = _birth_place(r)
         else:
             rec["death"] = rec["death"] or date
             place = _standardise_place(str(v(r, _C_TOWN)).strip())
@@ -1839,6 +2021,16 @@ def read_spreadsheet(
     full_index: dict[tuple[str, str], Individual] = {}
     for ind in list(dedup_map.values()) + list(synth_by_name.values()):
         full_index.setdefault(_full_key(ind.given_name, ind.surname), ind)
+    # For the no-code files, a block person can be the same individual the main
+    # tree already records under a *married* surname — e.g. block "Dorothy Jane
+    # PRICE" is main-tree "Dorothy Jane STEELE née Price". Register née people
+    # under their maiden surname too so the block unifies with them rather than
+    # minting a duplicate.
+    if profile.name_link_uncoded:
+        for pr in person_rows:
+            if pr["maiden"]:
+                ind = dedup_map[pr["dedup_key"]]
+                full_index.setdefault(_full_key(ind.given_name, pr["maiden"]), ind)
 
     # Materialise each block person, unifying with existing/synthetic records.
     # Same full name + different parents (e.g. John Forster the father vs John
@@ -1851,6 +2043,13 @@ def read_spreadsheet(
         nk = _ind_name_key(rec["given"], rec["surname_base"])
         fk = _full_key(rec["given"], rec["surname_base"])
         ind = None if fk in block_fullname_seen else full_index.get(fk)
+        # A née block woman is filed under her married surname here but the main
+        # tree referenced her by maiden name (e.g. block "Mary Ann PRICE née
+        # Muldoon" = the synthetic "Mary Muldoon" implied as Dorothy's mother).
+        # Fall back to her maiden key so the two unify. No-code files only.
+        if ind is None and profile.name_link_uncoded and rec.get("maiden"):
+            mk = _ind_name_key(rec["given"], rec["maiden"])
+            ind = synth_by_name.get(mk) or existing_by_name.get(mk)
         block_fullname_seen.add(fk)
         if ind is None:
             _id_counter += 1
@@ -1867,6 +2066,8 @@ def read_spreadsheet(
         full_index.setdefault(fk, ind)
         if not ind.birth_date and rec["birth"]:
             ind.birth_date = rec["birth"]
+        if not ind.birth_place and rec.get("birth_place"):
+            ind.birth_place = rec["birth_place"]
         if not ind.death_date and rec["death"]:
             ind.death_date = rec["death"]
         if not ind.death_place and rec["death_place"]:
@@ -2132,13 +2333,18 @@ def read_spreadsheet(
             return None
 
         for r in range(DATA_START_ROW, DATA_END_ROW):
+            if r in _excluded_rows:
+                continue
             code = str(v(r, _C_CODE)).strip().replace("|", "/")
             surname_raw = str(v(r, _C_SURNAME)).strip()
             given_raw = str(v(r, _C_GIVEN)).strip()
-            if (fv(r) == "M"
+            if (fv(r) in ("B", "D", "M")
                     or (profile.code_convention == "none"
                         and _is_marriage_label(given_raw))
                     or (not surname_raw and not given_raw and not code)):
+                # B/D flag rows are free-standing event blocks — Pass 5's domain;
+                # handling them here too would mint a duplicate of every block
+                # person. 'M' rows and pure-layout rows are likewise not people.
                 continue
             if code:
                 # Coded rows are Pass 3's work; they also break a compact block.
@@ -2279,6 +2485,15 @@ def read_spreadsheet(
                     src = row_marr2[cands[0]]
                     fam.marriage_date = src["marr_date"]
                     fam.marriage_place = src["marr_place"]
+
+    # Mark each divorced spouse's family as ended in divorce (1 DIV). Done here,
+    # after every family is built, so the name-linked families (Pass 4b/6) that
+    # a divorced spouse may head are covered too, not only the Pass-3 ones.
+    if divorced_spouse_ids:
+        for fam in families:
+            if (fam.husband_id in divorced_spouse_ids
+                    or fam.wife_id in divorced_spouse_ids):
+                fam.divorced = True
 
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.

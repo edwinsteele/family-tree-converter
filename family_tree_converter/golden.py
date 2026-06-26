@@ -30,6 +30,7 @@ CONVERTED_FILES = [
     "C & A Stl H.Tree #81",
     "Hcks:Thos:Krsl H.Tr.#120",
     "Brc:Stl H.Tree #46",
+    "J & D J Steele H.Tree #30",
 ]
 
 
