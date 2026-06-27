@@ -273,6 +273,8 @@ class Individual:
     lineage_lines: set[str] = field(default_factory=set)
     # Successive married surnames for a woman recorded as "X then Y".
     married_surnames: list[str] = field(default_factory=list)
+    # Family ids this person is linked to as an ADOPTED child (FAMC PEDI adopted).
+    adopted_famc: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1839,6 +1841,38 @@ def read_spreadsheet(
             up = [c for c in cands if gen_by_id.get(c) == child_gen + 1]
             return uncoded_ind_by_id.get(up[0]) if len(up) == 1 else None
 
+        # People whose surname is the genealogist's literal "?" (unknown
+        # surname), indexed by (first given word, generation). A chart references
+        # such a person as a parent by given name plus a "?" surname
+        # ("Samantha ?"), which _parse_parent_name reduces to a given-only
+        # reference — so without this the reference mints a duplicate synthetic
+        # instead of reusing the real row (e.g. three Samanthas). Because "?" is
+        # the genealogist's explicit "unknown", a given-only reference may unify
+        # with the *unique* same-given "?"-surname person exactly one generation
+        # above the child. No-code files only.
+        qmark_by_given_gen: dict[tuple[str, float], set[str]] = {}
+        for _iid, _indiv in uncoded_ind_by_id.items():
+            if (_indiv.surname or "").strip() == "?":
+                _g = gen_by_id.get(_iid)
+                _tok = _first_word(_indiv.given_name)
+                if _g is not None and _tok and _tok != "?":
+                    qmark_by_given_gen.setdefault((_tok, _g), set()).add(_iid)
+
+        def _qmark_match(
+            parsed: tuple[str | None, str | None] | None, child_gen: float | None
+        ) -> Individual | None:
+            """Link a given-only parent reference (its surname was the
+            genealogist's "?" unknown marker) to the unique same-given
+            "?"-surname person one generation above the child, collapsing what
+            would otherwise be a duplicate synthetic. Given-only refs only."""
+            if not parsed or not parsed[0] or parsed[1] or child_gen is None:
+                return None
+            tok = _first_word(parsed[0])
+            if not tok or _is_initial(tok):
+                return None
+            cands = qmark_by_given_gen.get((tok, child_gen + 1), set())
+            return uncoded_ind_by_id.get(next(iter(cands))) if len(cands) == 1 else None
+
         def _parent_family_uncoded(pkey: tuple[str | None, str | None]) -> Family:
             """Family for a name-linked child's parents, reusing one a path code
             already built for the same couple so children don't spawn a phantom
@@ -1880,11 +1914,13 @@ def read_spreadsheet(
                 _gen_disambig(fp, child_gen)
                 or (_gen_variant_match(fp, child_gen) if spell_tolerant else None)
                 or _initials_match(fp, child_gen)
+                or (_qmark_match(fp, child_gen) if spell_tolerant else None)
                 or _resolve_parent(fp, "M", avoid, ind.birth_date))
             mother_ind = (
                 _gen_disambig(mp, child_gen)
                 or (_gen_variant_match(mp, child_gen) if spell_tolerant else None)
                 or _initials_match(mp, child_gen)
+                or (_qmark_match(mp, child_gen) if spell_tolerant else None)
                 or _resolve_parent(mp, "F", avoid, ind.birth_date,
                                    co_parent=father_ind))
             if father_ind is None and mother_ind is None:
@@ -2485,6 +2521,49 @@ def read_spreadsheet(
                     src = row_marr2[cands[0]]
                     fam.marriage_date = src["marr_date"]
                     fam.marriage_place = src["marr_place"]
+
+    # Link a child recorded as adopted (father AND mother columns both literally
+    # "[Adopted]") to the family it is drawn under in the chart. Such a child
+    # names no real parents, so the parent-name passes leave it orphaned even
+    # though the genealogist positioned it directly beneath an adoptive couple.
+    # Attach it to the nearest preceding spouse's family one generation up, with
+    # a "PEDI adopted" linkage so the relationship is recorded as adoptive, not
+    # biological. The verbatim "[Adopted]" note stays on the child. No-code
+    # files only (the only files with this gen-numbered, name-linked layout).
+    if profile.name_link_uncoded:
+        adopt_gen_by_id: dict[str, float] = {}
+        for prow in person_rows:
+            g = v(prow["row"], _C_GENERATION)
+            if isinstance(g, float):
+                adopt_gen_by_id.setdefault(dedup_map[prow["dedup_key"]].id, g)
+        linked_children = {cid for fam in families for cid in fam.child_ids}
+        fam_by_spouse: dict[str, Family] = {}
+        for fam in families:
+            for sid in (fam.husband_id, fam.wife_id):
+                if sid:
+                    fam_by_spouse.setdefault(sid, fam)
+        rows_sorted = sorted(person_rows, key=lambda pr: pr["row"])
+        for i, prow in enumerate(rows_sorted):
+            fr = (prow.get("father_raw") or "").lower()
+            mr = (prow.get("mother_raw") or "").lower()
+            if "[adopt" not in fr or "[adopt" not in mr:
+                continue
+            child = dedup_map[prow["dedup_key"]]
+            if child.id in linked_children:
+                continue
+            cg = adopt_gen_by_id.get(child.id)
+            if cg is None:
+                continue
+            target = None
+            for prev in reversed(rows_sorted[:i]):
+                pid = dedup_map[prev["dedup_key"]].id
+                if adopt_gen_by_id.get(pid) == cg + 1 and pid in fam_by_spouse:
+                    target = fam_by_spouse[pid]
+                    break
+            if target is not None:
+                target.child_ids.append(child.id)
+                linked_children.add(child.id)
+                child.adopted_famc.add(target.id)
 
     # Mark each divorced spouse's family as ended in divorce (1 DIV). Done here,
     # after every family is built, so the name-linked families (Pass 4b/6) that

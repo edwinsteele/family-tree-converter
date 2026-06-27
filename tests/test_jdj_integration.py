@@ -63,16 +63,18 @@ def test_profile_selected_by_name():
 
 def test_counts_and_integrity(parsed):
     individuals, families = parsed
-    assert len(individuals) == 169
-    assert len(families) == 51
+    assert len(individuals) == 164
+    assert len(families) == 46
     result = validate(individuals, families)
     assert result["errors"] == []
     assert result["warnings"] == []
 
 
-def test_only_unknowable_parentage_is_orphaned(parsed):
-    # Everyone links into a family except the two whose parentage the source
-    # leaves unknowable: the adopted Queenie and "Amy" (recorded with no surname).
+def test_no_orphans(parsed):
+    # Every individual links into at least one family. The two adopted children
+    # (Queenie, Amy), once orphaned because their parent columns are "[Adopted]",
+    # are now attached by adjacency to the family they are drawn under (see
+    # test_adopted_children_linked_by_adjacency).
     individuals, families = parsed
     in_family = {
         s for f in families
@@ -80,7 +82,39 @@ def test_only_unknowable_parentage_is_orphaned(parsed):
     }
     orphan_givens = sorted(
         (i.given_name or "") for i in individuals if i.id not in in_family)
-    assert orphan_givens == ["Amy", "Queenie"]
+    assert orphan_givens == []
+
+
+def test_qmark_surname_chain_not_duplicated(parsed):
+    # The descendant chain whose surnames the genealogist left as "?" references
+    # parents by "<given> ?" — a given-only reference. Each such person must
+    # appear exactly once (linked to their own children), not be split into a
+    # real row plus duplicate synthetics.
+    individuals, families = parsed
+    for given in ("Denise", "Samantha", "Ian", "Christopher"):
+        matches = [i for i in individuals
+                   if (i.given_name or "").split()[:1] == [given]
+                   and (i.surname or "").strip() == "?"]
+        assert len(matches) == 1, f"{given}: {[m.given_name for m in matches]}"
+        # and they head a family containing their referenced children
+        assert any(matches[0].id in (f.husband_id, f.wife_id) and f.child_ids
+                   for f in families)
+
+
+def test_adopted_children_linked_by_adjacency(parsed):
+    # Queenie (under Jack + Jane Bruce "Queenie" Williams) and Amy (under Ian +
+    # Diane) are recorded with both parents "[Adopted]". They are linked as a
+    # child of the adjacent family with a PEDI adopted pedigree (faithful: the
+    # genealogist drew them there; the link is marked adoptive, not biological).
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    for given, surname, mother_given in (
+            ("Queenie", "WILLIAMS", "Jane Bruce"), ("Amy", "?", "Elizabeth Diane")):
+        child = _find(individuals, given, surname)[0]
+        fam = next(f for f in families if child.id in f.child_ids)
+        assert fam.id in child.adopted_famc
+        wife = by_id.get(fam.wife_id)
+        assert wife and mother_given in (wife.given_name or "")
 
 
 def test_disavowed_price_block_excluded(parsed):

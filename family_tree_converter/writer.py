@@ -121,6 +121,11 @@ def render_gedcom(
             lines.append(f"1 FAMS @{fam_id}@")
         for fam_id in famc.get(ind.id, []):
             lines.append(f"1 FAMC @{fam_id}@")
+            if fam_id in ind.adopted_famc:
+                # The chart placed this person in the family as an adopted child;
+                # the standard GEDCOM 5.5.1 pedigree linkage type records that
+                # without asserting a biological parent-child relationship.
+                lines.append("2 PEDI adopted")
 
     for fam in families:
         lines.append(f"0 @{fam.id}@ FAM")
