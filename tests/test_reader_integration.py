@@ -45,6 +45,26 @@ def test_generation_zero_rows_are_kept(parsed):
     assert _find(individuals, "Adrienne Lois")
 
 
+def test_adrienne_adoption_recorded_with_pedi(parsed):
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    adrienne = _find(individuals, "Adrienne Lois")[0]
+    famc = [f for f in families if adrienne.id in f.child_ids]
+    # Two parent couples: biological (Belshaw/Norma) and adoptive (Green).
+    assert len(famc) == 2
+    green = [f for f in famc
+             if (by_id.get(f.husband_id) or adrienne).surname.upper() == "GREEN"]
+    belshaw = [f for f in famc
+               if (by_id.get(f.husband_id) or adrienne).surname.upper() == "BELSHAW"]
+    assert len(green) == 1 and len(belshaw) == 1
+    # Only the Green (adoptive) family is flagged adopted; Belshaw stays
+    # biological. The genealogist's prose note recording the adoption is kept.
+    assert green[0].id in adrienne.adopted_famc
+    assert belshaw[0].id not in adrienne.adopted_famc
+    assert any("adoptive parents" in n for n in
+               [*adrienne.note_list, *green[0].note_list])
+
+
 def test_child_parent_chain_is_linked(parsed):
     individuals, families = parsed
     by_id = {i.id: i for i in individuals}

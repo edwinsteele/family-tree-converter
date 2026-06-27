@@ -366,6 +366,18 @@ _MANUAL_CORRECTIONS: dict[tuple[str, str, str], dict[str, str]] = {
                  "the source's recorded \"152\" is a typo and his birth month may "
                  "be May."),
     },
+    # Adrienne is charted under TWO couples: her biological parents Robert
+    # ("Bob") Belshaw + Norma, and Arthur & Edna Green. The genealogist's own
+    # notes state plainly that "Arthur & Edna Green were Adrienne's adoptive
+    # parents" (Edna being her natural aunt) and that she "lived with her natural
+    # mother Norma for the first 6 months". So the Green link is adoptive, not a
+    # second biological parentage: tag that family FAMC with PEDI adopted (with
+    # the family's permission); the Belshaw couple stays her biological FAMC.
+    # ``adopted_parents`` names the adoptive father (given substring, surname)
+    # used to pick the family.
+    ("BlsGrnLivMcCl", "STEELE", "Adrienne Lois"): {
+        "adopted_parents": ("Arthur", "GREEN"),
+    },
 }
 
 
@@ -2989,7 +3001,13 @@ def read_spreadsheet(
                 0, "Married surname" + ("s" if len(ind.married_surnames) > 1 else "")
                 + ": " + ", then ".join(ind.married_surnames) + ".")
 
-    # Apply manual source-error corrections (e.g. the EVANS "152" birth typo).
+    # Apply manual source-error corrections (e.g. the EVANS "152" birth typo) and
+    # documented structured facts (e.g. Adrienne's recorded adoption).
+    final_by_id = {i.id: i for i in ordered}
+    famc_of: dict[str, list[Family]] = {}
+    for f in families:
+        for c in f.child_ids:
+            famc_of.setdefault(c, []).append(f)
     for ind in ordered:
         corr = _MANUAL_CORRECTIONS.get(
             (profile.name, (ind.surname or "").upper(), ind.given_name))
@@ -3004,6 +3022,14 @@ def read_spreadsheet(
         note = corr.get("note")
         if note and note not in ind.note_list:
             ind.note_list.append(note)
+        ap = corr.get("adopted_parents")
+        if ap:
+            given_sub, surname = ap[0].lower(), ap[1].upper()
+            for f in famc_of.get(ind.id, []):
+                head = final_by_id.get(f.husband_id)
+                if (head and given_sub in (head.given_name or "").lower()
+                        and surname in (head.surname or "").upper()):
+                    ind.adopted_famc.add(f.id)
 
     if diag is not None:
         # Minted-record markers: synthetic parents are the name-keyed individuals
