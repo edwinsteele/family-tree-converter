@@ -359,9 +359,27 @@ def _parse_approx_string(s: str) -> str | None:
     if not re.search(r"\d", s):
         return None
 
+    # Strip English ordinal suffixes so "11th June 1920" / "8th August" read as
+    # "11 June 1920" / "8 August" for the patterns below.
+    deordinal = re.sub(r"(\d{1,2})(?:st|nd|rd|th)\b", r"\1", s.strip(),
+                       flags=re.IGNORECASE)
+
     # Normalise separators so "mid.1950s" and "mid 1950s" both match, and fold
     # a typographic apostrophe to a plain one so "Dec'91" / "Dec’91" both match.
-    normalised = s.replace(".", " ").replace("’", "'").strip().lower()
+    normalised = deordinal.replace(".", " ").replace("’", "'").strip().lower()
+
+    # A day + month with NO year cannot be a valid GEDCOM date — return None so no
+    # DATE is emitted; the raw form is preserved as a NOTE by
+    # _date_precision_note (e.g. Hcks "8th August", "26th June").
+    m = re.fullmatch(r"(\d{1,2})\s+([a-z]+)", normalised)
+    if m and m.group(2) in _MONTH_NAMES:
+        return None
+
+    # Circa year-range "c.1819/20" → "BET 1819 AND 1820".
+    m = re.match(r"^(?:c|ca|circa)\s+(\d{4})\s*/\s*\d{1,2}$", normalised)
+    if m:
+        year = int(m.group(1))
+        return f"BET {year} AND {year + 1}"
 
     # "v approx YYYY" → "ABT YYYY"
     m = re.match(r"^v\s+approx\s+(\d{4})$", normalised)
@@ -506,7 +524,12 @@ def _parse_date(val: Any) -> str | None:
                 # Excel date serial (e.g. 24166 → 28 FEB 1966)
                 d = datetime.date(1899, 12, 30) + datetime.timedelta(days=date_int)
                 return f"{d.day} {_MONTHS[d.month - 1]} {d.year}"
-            # Year-only stored as plain integer (e.g. 1760.0)
+            # Year-only stored as plain integer (e.g. 1760.0). A value below 1000
+            # is a source typo (e.g. Stiff:Taylor's "152") — too short to be a
+            # real year in this 18th–20th-century data; drop it from the DATE,
+            # preserved instead as a note by _date_precision_note.
+            if date_int < 1000:
+                return None
             return str(date_int)
         if 1 <= month <= 12:
             if day > 0:
@@ -530,22 +553,38 @@ def _date_precision_note(val: Any, label: str) -> str | None:
     so it is emitted as "BET 1940 AND 1949". The headline range hides that the
     event was a 28 Feb; this note records it so nothing is silently lost.
     """
+    # A numeric year-only value below 1000 is a source typo too short to be a
+    # real year here; dropped from the DATE, the raw figure is kept as a note.
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        iv = int(val)
+        if 0 < iv < 1000:
+            return (f"{label} date recorded as \"{iv}\", which is too short to be "
+                    "a valid year (likely a source typo).")
     if not isinstance(val, str):
         return None
     m = re.match(r"^(\d{3})\?-(\d{2})(?:-(\d{2}))?$", val.strip())
-    if not m:
-        return None
-    month = int(m.group(2))
-    if not 1 <= month <= 12:
-        return None
-    known = _MONTHS[month - 1]
-    if m.group(3):
-        known = f"{int(m.group(3))} {known}"
-    decade = int(m.group(1)) * 10
-    return (
-        f"{label} date recorded as \"{val.strip()}\": {known} is known, but "
-        f"the year is uncertain within the {decade}s."
-    )
+    if m:
+        month = int(m.group(2))
+        if not 1 <= month <= 12:
+            return None
+        known = _MONTHS[month - 1]
+        if m.group(3):
+            known = f"{int(m.group(3))} {known}"
+        decade = int(m.group(1)) * 10
+        return (
+            f"{label} date recorded as \"{val.strip()}\": {known} is known, but "
+            f"the year is uncertain within the {decade}s."
+        )
+
+    # A day + month with no year is dropped from the DATE (GEDCOM needs a year);
+    # preserve the genealogist's raw entry as a note so nothing is lost.
+    deord = re.sub(r"(\d{1,2})(?:st|nd|rd|th)\b", r"\1", val.strip(),
+                   flags=re.IGNORECASE)
+    m = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]+)\.?", deord)
+    if m and m.group(2).lower() in _MONTH_NAMES:
+        return (f"{label} date recorded as \"{val.strip()}\", "
+                "but the year was not given.")
+    return None
 
 
 def _longevity_discrepancy_note(
