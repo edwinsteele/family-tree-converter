@@ -228,6 +228,7 @@ JDJSTEELE_PROFILE = FormatProfile(
     line_first=999,  # no lineage-membership columns
     marker=13,  # col 13: Sp (married-in spouse)
     status_marker=11,  # col 11: Dv (this marriage ended in divorce)
+    approx_flag=28,  # 'A' = year uncertain (legend row 12); wrap year-only dates ABT
     code_convention="none",  # no path codes; link by generation + parent names
     name_link_uncoded=True,
     # Rows 165-184: the disavowal note, the 13 disavowed PRICE entries the
@@ -2149,7 +2150,7 @@ def read_spreadsheet(
         for n in block_notes:
             if n not in rec["notes"]:
                 rec["notes"].append(n)
-        date = _parse_date(v(r, _C_DATE1))
+        date = _approx(r, _parse_date(v(r, _C_DATE1)))
         if flag == "B":
             rec["birth"] = rec["birth"] or date
             # Capture the birth place too — only for the no-code files, so file

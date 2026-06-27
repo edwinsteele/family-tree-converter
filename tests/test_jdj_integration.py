@@ -226,3 +226,19 @@ def test_year_first_numeric_date(parsed):
     john = next(i for i in _find(individuals, "John", "STEELE")
                 if i.death_date == "3 FEB 1931")
     assert john is not None
+
+
+def test_approx_flag_wraps_year_only_dates(parsed):
+    # Col 28 carries the "Approx. (A)" flag (legend row 12). Year-only dates on a
+    # flagged row are wrapped ABT (full day/month/year dates stay exact), including
+    # rows inside the PRICE event block.
+    individuals, _ = parsed
+    james = _find(individuals, "James Alexander Bruce", "STEELE")[0]
+    assert james.birth_date == "ABT 1904"
+    assert james.death_date == "ABT 1961"
+    # Block (Pass 5) row also honours the flag.
+    mary = _find(individuals, "Mary A.", "PRICE")[0]
+    assert mary.birth_date == "ABT 1852"
+    # A full death date on a flagged row stays exact.
+    dorothy = _find(individuals, "Dorothy Jane", "STEELE")[0]
+    assert dorothy.death_date == "15 SEP 1938"
