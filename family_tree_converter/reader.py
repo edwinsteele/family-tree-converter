@@ -170,6 +170,8 @@ HCKS_PROFILE = FormatProfile(
     longevity=29, marriage=31, married_place=32, occupation=33, notes=34,
     line_first=999,  # no lineage-membership columns
     marker=16,  # col 16: Sp (married-in spouse) / X (sibling-and-married)
+    approx_flag=30,  # 'A' = year uncertain (legend "Approximate (A)"); year-only
+    #                  dates on the 19 flagged rows are wrapped ABT
     private_note_cols=(35, 36),  # "Not for publication"
     code_convention="alpha",
     name_link_uncoded=True,  # half the rows are coded; the rest link by name
@@ -2623,11 +2625,24 @@ def read_spreadsheet(
                 for sid in (fam.husband_id, fam.wife_id):
                     if sid:
                         fam_count[sid] = fam_count.get(sid, 0) + 1
+            # A person carries a single col-31 marriage date describing ONE of
+            # their marriages. If that date was already placed on a family built
+            # before this pass (e.g. the coded first marriage), it is spoken for —
+            # it must not be copied again onto a later, name-linked family for a
+            # *different* spouse. Snapshot who is already dated so a remarried
+            # person's date does not leak across both unions: Lorna Ruth Kerslake
+            # married NAGLE (1934, coded family) then HARTLEY (a Pass-6 family);
+            # without this her 1934 leaked onto the Hartley marriage too.
+            pre_dated = {
+                sid for fam in families
+                if fam.marriage_date or fam.marriage_place
+                for sid in (fam.husband_id, fam.wife_id) if sid
+            }
             for fam in families:
                 if fam.marriage_date or fam.marriage_place:
                     continue
                 cands = [s for s in (fam.husband_id, fam.wife_id)
-                         if s and s in row_marr2]
+                         if s and s in row_marr2 and s not in pre_dated]
                 cands.sort(key=lambda s: (fam_count.get(s, 0),
                                           0 if s == fam.husband_id else 1))
                 if cands:

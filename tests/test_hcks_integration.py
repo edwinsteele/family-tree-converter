@@ -263,3 +263,37 @@ def test_given_only_mothers_not_over_merged(parsed):
         assert fam is not None
         husband_surnames.add((by_id[fam.husband_id].surname or "").upper())
     assert husband_surnames == {"BRYAN", "BURROWES"}
+
+
+def test_remarriage_date_not_leaked_to_second_union(parsed):
+    # Lorna Ruth Kerslake married NAGLE (1934, Hurstville) then HARTLEY. Her single
+    # col-31 date describes only the Nagle marriage; it must not be copied onto the
+    # later, name-linked Hartley family.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    lorna = _find(individuals, "Lorna Ruth", "Kerslake")[0]
+
+    def hsur(f):
+        h = by_id.get(f.husband_id)
+        return (h.surname or "").upper() if h else ""
+
+    her_fams = [f for f in families if lorna.id in (f.husband_id, f.wife_id)]
+    nagle = [f for f in her_fams if "NAGLE" in hsur(f)]
+    hartley = [f for f in her_fams if "HART" in hsur(f)]
+    # Arthur Nagle's row is also Approximate-(A) flagged, so the Nagle date wraps
+    # ABT; the point is that the Hartley marriage carries no date at all.
+    assert nagle and nagle[0].marriage_date == "ABT 1934"
+    assert hartley and hartley[0].marriage_date is None
+
+
+def test_approximate_flag_wraps_year_only_dates(parsed):
+    # Col 30 carries the "Approximate (A)" flag (legend row 15). A year-only date
+    # on a flagged row must be wrapped ABT; full day/month/year dates stay exact.
+    individuals, _ = parsed
+    annie = _find(individuals, "Annie", "Williams")
+    annie = [i for i in annie if i.birth_date == "ABT 1886"]
+    assert annie and annie[0].death_date == "ABT 1888"
+    # A full birth date on a flagged row is left exact (only the year-only death wraps).
+    charles = _find(individuals, "Charles James", "Williams")[0]
+    assert charles.birth_date == "18 APR 1890"
+    assert charles.death_date == "ABT 1966"
