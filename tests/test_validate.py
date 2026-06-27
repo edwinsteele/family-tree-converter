@@ -44,3 +44,27 @@ def test_validate_catches_sex_role_mismatch():
             Individual(id="I2", given_name="B", surname="Y", sex="F")]
     fams = [Family(id="F1", husband_id="I1", wife_id="I2")]
     assert any("husband" in e and "female" in e for e in validate(inds, fams)["errors"])
+
+
+def test_validate_flags_implausible_maternal_age():
+    # A mother bearing a child at 55 is flagged (the Mary Muldoon / 22-child
+    # block pattern); the father at the same age is not.
+    inds = [Individual(id="I1", given_name="Dad", surname="P", sex="M",
+                       birth_date="1831"),
+            Individual(id="I2", given_name="Mum", surname="P", sex="F",
+                       birth_date="1833"),
+            Individual(id="I3", given_name="Late", surname="P", birth_date="1888")]
+    fams = [Family(id="F1", husband_id="I1", wife_id="I2", child_ids=["I3"])]
+    warns = validate(inds, fams)["warnings"]
+    assert any("maternal age" in w for w in warns)
+    assert not any("father" in w and "maternal" in w for w in warns)
+
+
+def test_validate_maternal_age_charitable_to_ranges():
+    # A range birth ("BET 1800 AND 1809") is judged at its latest year so a
+    # plausibly-young mother does not false-fire (Sarah Clow).
+    inds = [Individual(id="I2", given_name="Mum", surname="C", sex="F",
+                       birth_date="BET 1800 AND 1809"),
+            Individual(id="I3", given_name="Kid", surname="C", birth_date="1853")]
+    fams = [Family(id="F1", wife_id="I2", child_ids=["I3"])]
+    assert not any("maternal age" in w for w in validate(inds, fams)["warnings"])

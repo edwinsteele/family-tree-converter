@@ -67,7 +67,22 @@ def test_counts_and_integrity(parsed):
     assert len(families) == 43
     result = validate(individuals, families)
     assert result["errors"] == []
-    assert result["warnings"] == []
+    # The only warnings are the implausible maternal ages in the flat PRICE
+    # block (Mary Muldoon recorded with 22 children to age 55 — see
+    # test_price_block_maternal_age_flagged); nothing else is suspicious.
+    assert all("maternal age" in w for w in result["warnings"])
+
+
+def test_price_block_maternal_age_flagged(parsed):
+    # The genealogist listed 22 PRICE births (1852-1888) in one flat block under
+    # John Price + Mary Muldoon, with no generations or parent names to split
+    # children from likely grandchildren. The converter keeps them faithfully but
+    # validate.py surfaces the biologically implausible tail (mother to age 55).
+    individuals, families = parsed
+    result = validate(individuals, families)
+    flagged = [w for w in result["warnings"]
+               if "Mary Muldoon" in w and "maternal age" in w]
+    assert len(flagged) == 3  # Winefred (51), Dora M. (53), Tom M. (55)
 
 
 def test_no_orphans(parsed):

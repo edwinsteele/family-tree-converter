@@ -23,6 +23,16 @@ def _year(date: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _year_latest(date: str | None) -> int | None:
+    """The latest 4-digit year in a date phrase — the most charitable reading of
+    a range like ``BET 1800 AND 1809`` (1809). Used so an age check only fires
+    when implausible even at the youngest possible birth year."""
+    if not date:
+        return None
+    years = re.findall(r"\b(\d{4})\b", date)
+    return int(years[-1]) if years else None
+
+
 def validate(
     individuals: list[Individual], families: list[Family]
 ) -> dict[str, list[str]]:
@@ -115,6 +125,20 @@ def validate(
                         f"{role} {name(sid)} ({s.birth_date})")
                 elif age < 13 or age > 60:
                     warnings.append(f"{name(sid)} was {age} when {role} of {name(c)}")
+                elif role == "mother" and age > 50:
+                    # A father may credibly be over 50; a mother bearing a child
+                    # past ~50 is biologically implausible and usually signals a
+                    # mis-grouped generation (grandchildren listed flat among
+                    # children) or an approximate maternal birth year — surfaced
+                    # for review, not silently restructured. Use the *latest*
+                    # possible maternal birth year so a range like
+                    # "BET 1800 AND 1809" is judged charitably and does not
+                    # false-fire (Sarah Clow, plausibly born 1809).
+                    late = _year_latest(s.birth_date)
+                    if late is not None and cb - late > 50:
+                        warnings.append(
+                            f"{name(sid)} was {cb - late} when mother of "
+                            f"{name(c)} (implausible maternal age)")
 
     # --- sex/role consistency ---
     for f in families:
