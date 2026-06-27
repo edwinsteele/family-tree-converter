@@ -12,8 +12,9 @@ are surfaced for a human to glance at, not necessarily fixed.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 
-from .reader import Family, Individual
+from .reader import Family, Individual, _similar_surname
 
 
 def _year(date: str | None) -> int | None:
@@ -149,3 +150,94 @@ def validate(
             errors.append(f"{f.id}: wife {name(f.wife_id)} is male")
 
     return {"errors": errors, "warnings": warnings}
+
+
+def _given_tokens(given: str | None) -> set[str]:
+    return set((given or "").lower().split("(")[0].replace(".", " ").split())
+
+
+def cross_file_audit(
+    individuals: list[Individual], families: list[Family]
+) -> list[str]:
+    """Report potential cross-file over- and under-merges for human review.
+
+    Run by :mod:`merge` after the per-file trees are combined. Neither category
+    is necessarily an error:
+
+    * **Over-merge** — an individual with more than one *distinct* parent couple
+      (FAMC > 1). Usually the genealogist's own cross-chart bridging (a person
+      charted in two lineage charts) or the downstream effect of a deliberately
+      kept conflict, but a genuine mistaken unification would also show here.
+    * **Under-merge** — two records that share surname (allowing a single
+      transcription typo), a compatible given name, the same birth year and a
+      compatible father, yet were *not* unified. Usually a deliberately kept
+      conflict, occasionally a missed match worth a look.
+
+    Both are surfaced as a spot-check list, not auto-corrected
+    (preserve-don't-assert).
+    """
+    by_id = {i.id: i for i in individuals}
+
+    def name(iid: str | None) -> str:
+        i = by_id.get(iid)
+        return f"{i.given_name} {i.surname}".strip() if i else f"<{iid}>"
+
+    lines: list[str] = []
+
+    # --- over-merge: a child with two or more distinct parent couples ---
+    famc: dict[str, list[Family]] = defaultdict(list)
+    for f in families:
+        for c in f.child_ids:
+            famc[c].append(f)
+    over: list[str] = []
+    for cid, fl in famc.items():
+        couples = {(f.husband_id, f.wife_id) for f in fl}
+        if len(couples) > 1:
+            desc = "; ".join(
+                f"{name(h)} + {name(w)}" for h, w in sorted(couples, key=str))
+            over.append(f"  - {name(cid)}: {len(couples)} parent couples — {desc}")
+    lines.append(f"OVER-MERGE — individuals with >1 parent couple ({len(over)}):")
+    lines += over or ["  (none)"]
+
+    # --- under-merge: same-identity records left distinct ---
+    father_first: dict[str, str] = {}
+    for f in families:
+        h = by_id.get(f.husband_id)
+        if h:
+            fw = (h.given_name or "").split()
+            for c in f.child_ids:
+                father_first.setdefault(c, fw[0].lower() if fw else "?")
+
+    def byear(d: str | None) -> int | None:
+        m = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", d or "")
+        return int(m.group(1)) if m else None
+
+    buckets: dict[tuple[str, int], list[Individual]] = defaultdict(list)
+    for i in individuals:
+        y = byear(i.birth_date)
+        toks = (i.given_name or "").lower().split("(")[0].split()
+        if y is not None and toks:
+            buckets[(toks[0], y)].append(i)
+
+    under: list[str] = []
+    for members in buckets.values():
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                x, y = members[a], members[b]
+                xs, ys = (x.surname or "").upper(), (y.surname or "").upper()
+                if not xs or not ys or not (xs == ys or _similar_surname(xs, ys)):
+                    continue
+                tx, ty = _given_tokens(x.given_name), _given_tokens(y.given_name)
+                if not (tx <= ty or ty <= tx):
+                    continue
+                fx = father_first.get(x.id, "?")
+                fy = father_first.get(y.id, "?")
+                if fx != "?" and fy != "?" and fx != fy:
+                    continue
+                under.append(
+                    f"  - {name(x.id)} (b.{x.birth_date}) vs "
+                    f"{name(y.id)} (b.{y.birth_date})")
+    lines += ["", f"UNDER-MERGE — same-identity records left separate "
+              f"({len(under)}):"]
+    lines += under or ["  (none)"]
+    return lines
