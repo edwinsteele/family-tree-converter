@@ -63,8 +63,8 @@ def test_profile_selected_by_name():
 
 def test_counts_and_integrity(parsed):
     individuals, families = parsed
-    assert len(individuals) == 164
-    assert len(families) == 46
+    assert len(individuals) == 162
+    assert len(families) == 43
     result = validate(individuals, families)
     assert result["errors"] == []
     assert result["warnings"] == []
@@ -194,6 +194,30 @@ def test_split_divorce_marker(parsed):
     fam = next(f for f in families
                if warren.id in (f.husband_id, f.wife_id))
     assert fam.divorced is True
+
+
+def test_two_corals_steele_not_conflated(parsed):
+    # Two different women née Steele are each referenced by their children as
+    # "Coral Steele": Coral C. (b.1907, married Cook O'Halloran) and Coral
+    # (b.1927, married Neil Morrisson). The shared given-only/maiden reference
+    # must not leave the two sets of children under one bogus shared mother; each
+    # set is re-homed onto the correct Coral and the synthetic placeholder dropped.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    corals_steele = [i for i in individuals
+                     if i.given_name and i.given_name.startswith("Coral")
+                     and (i.surname or "").upper() == "STEELE"]
+    assert corals_steele == []  # no leftover synthetic "Coral Steele"
+    ohalloran = next(i for i in individuals
+                     if "Coral" in (i.given_name or "") and "O" in (i.surname or "")
+                     and "HALLORAN" in (i.surname or ""))
+    morrisson = next(i for i in individuals
+                     if "Coral" in (i.given_name or "") and i.surname == "MORRISSON")
+    assert ohalloran.id != morrisson.id
+    o_kids = next(f for f in families if f.wife_id == ohalloran.id).child_ids
+    m_kids = next(f for f in families if f.wife_id == morrisson.id).child_ids
+    assert {by_id[c].given_name for c in o_kids} == {"Jack", "Jill", "Maureen", "James"}
+    assert {by_id[c].given_name for c in m_kids} == {"Richard", "Janine", "Robin"}
 
 
 def test_year_first_numeric_date(parsed):

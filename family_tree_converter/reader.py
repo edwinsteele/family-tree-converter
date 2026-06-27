@@ -91,6 +91,11 @@ class FormatProfile:
     # such pair.
     surname_alt: int | None = None
     given_alt: int | None = None
+    # Column of an "Approximate (A)" flag: when it holds 'A' the genealogist has
+    # marked a date on the row as uncertain in its year (Stiff:Taylor col 32).
+    # A year-only date on such a row is wrapped 'ABT'; a full day/month/year date
+    # is left exact. None when the file has no such column.
+    approx_flag: int | None = None
     # Structural convention used to derive family relationships:
     #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
     #   "none"  – no path code; link by generation + parent names + role markers
@@ -251,6 +256,7 @@ STIFFTAYLOR_PROFILE = FormatProfile(
     status_marker=13,  # col 13: Dv (this marriage ended in divorce)
     private_note_cols=(36, 37),  # "not for publication"
     surname_alt=26, given_alt=27,  # dup name cols; used when primary is blank
+    approx_flag=32,  # 'A' = year uncertain; wrap year-only dates as ABT
     code_convention="none",  # no path codes; link by generation + parent names
     name_link_uncoded=True,
 )
@@ -950,6 +956,7 @@ def read_spreadsheet(
     _C_MARKER = p.marker
     _C_STATUS = p.status_marker
     _C_SURNAME_ALT, _C_GIVEN_ALT = p.surname_alt, p.given_alt
+    _C_APPROX = p.approx_flag
 
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
@@ -976,6 +983,15 @@ def read_spreadsheet(
         """Secondary status marker (Dv/Df/Tw) when the file splits it into its
         own column, or '' when there is no such column."""
         return "" if _C_STATUS is None else str(v(r, _C_STATUS)).strip()
+
+    def _approx(r: int, date: str | None) -> str | None:
+        """Wrap a year-only date as 'ABT' when the row's Approximate (A) flag is
+        set; leave full dates and already-qualified dates unchanged."""
+        if (date and _C_APPROX is not None
+                and str(v(r, _C_APPROX)).strip() == "A"
+                and re.fullmatch(r"\d{3,4}", date)):
+            return f"ABT {date}"
+        return date
 
     def _is_person_row(r: int, code: str, generation: Any) -> bool:
         """A data row describes an individual. Most files number the generation
@@ -1190,8 +1206,8 @@ def read_spreadsheet(
                 pn = _date_precision_note(v(r, cell), lbl)
                 if pn:
                     person_notes.append(pn)
-            birth_date = _parse_date(v(r, _C_DATE1))
-            death_date = _parse_date(v(r, _C_DEATH_DATE))
+            birth_date = _approx(r, _parse_date(v(r, _C_DATE1)))
+            death_date = _approx(r, _parse_date(v(r, _C_DEATH_DATE)))
             death_place = _standardise_place(str(v(r, _C_BURIED)).strip()) or None
             ld = _longevity_discrepancy_note(birth_date, death_date, _longevity(r))
             if ld:
@@ -1225,7 +1241,7 @@ def read_spreadsheet(
                 "death_place": death_place,
                 # Marriage date/place are recorded on each spouse's own row
                 # (cols 31/32), not only on the rarer 'M'-flag rows.
-                "marr_date": _parse_date(v(r, _C_MARRIAGE)),
+                "marr_date": _approx(r, _parse_date(v(r, _C_MARRIAGE))),
                 "marr_place": _standardise_place(str(v(r, _C_MARRIED_PLACE)).strip()) or None,
                 "sex": _infer_sex(surname),
                 "occupation": str(v(r, _C_OCCUPATION)).strip() or None,
@@ -2773,13 +2789,101 @@ def read_spreadsheet(
                     if note not in fam.note_list:
                         fam.note_list.append(note)
 
+    # Consolidate a wife recorded twice under one husband. When children name
+    # their mother by given name only ("Jean") or by her maiden surname, the
+    # reference can mint a given-only synthetic OR match a same-given namesake
+    # who married into a different family — leaving the children under the wrong
+    # mother while the real wife (recorded on her own row, having taken the
+    # husband's surname) heads a separate, childless family. Re-home the children
+    # onto the wife whose surname matches the husband's and drop the duplicate.
+    # Fixes e.g. Clive Steele's children, recorded under "Edna Stiff", landing on
+    # Edna Mary Stiff née Tracey instead of his wife Edna May Steele née Stiff;
+    # and the seven given-only synthetic mothers (Jean Evans, Madge Lock, ...).
+    # No-code files only.
+    remove_inds: set[str] = set()
+    if profile.code_convention == "none":
+        all_inds = {i.id: i for i in (list(dedup_map.values())
+                    + list(synth_by_name.values()) + block_created
+                    + nogen_created)}
+        # Synthetic parents are the name-keyed individuals minted from a parent
+        # reference (never from a data row); a mother named only by a reference
+        # is one of these and, once her children move to the real wife, is a
+        # placeholder to discard. A real wife recorded under a different surname
+        # (Aunty Mary, née Tracey) has her own row and other families, so she is
+        # only detached from this husband, not removed.
+        real_ids = ({i.id for i in dedup_map.values()}
+                    | {i.id for i in block_created}
+                    | {i.id for i in nogen_created})
+        synthetic_ids = {i.id for i in synth_by_name.values()
+                         if i.id not in real_ids}
+
+        def _gtoks(ind: Individual) -> set[str]:
+            return set((ind.given_name or "").lower().replace(".", " ").split())
+
+        by_husband: dict[str, list[Family]] = {}
+        for f in families:
+            if f.husband_id:
+                by_husband.setdefault(f.husband_id, []).append(f)
+        removed_fams: set[str] = set()
+        candidate_remove: set[str] = set()
+        for hid, fl in by_husband.items():
+            husband = all_inds.get(hid)
+            if husband is None or not husband.surname:
+                continue
+            hs = husband.surname.upper()
+            # The "correct" wife took the husband's surname (recorded on her own
+            # row as his Sp spouse). Act only when exactly one family qualifies.
+            correct = [f for f in fl
+                       if all_inds.get(f.wife_id) is not None
+                       and (all_inds[f.wife_id].surname or "").upper() == hs]
+            if len(correct) != 1:
+                continue
+            cf = correct[0]
+            cwife = all_inds[cf.wife_id]
+            ctoks = _gtoks(cwife)
+            for f in fl:
+                owife = all_inds.get(f.wife_id)
+                if (f is cf or f.id in removed_fams or owife is None
+                        or f.wife_id == cf.wife_id):
+                    continue
+                # A duplicate only if the other wife did NOT take the husband's
+                # surname yet shares a given token with the correct wife (the
+                # same first name recorded two ways / a mis-resolved namesake).
+                if (owife.surname or "").upper() == hs or not (_gtoks(owife) & ctoks):
+                    continue
+                for c in f.child_ids:
+                    if c not in cf.child_ids:
+                        cf.child_ids.append(c)
+                if not cf.marriage_date and f.marriage_date:
+                    cf.marriage_date = f.marriage_date
+                if not cf.marriage_place and f.marriage_place:
+                    cf.marriage_place = f.marriage_place
+                for n in f.note_list:
+                    if n not in cf.note_list:
+                        cf.note_list.append(n)
+                # A synthetic placeholder mother IS the correct wife recorded
+                # weakly — discard her once her family is gone. A real,
+                # differently-surnamed namesake (Aunty Mary, née Tracey) is a
+                # distinct person and is only detached from this husband.
+                if owife.id in synthetic_ids:
+                    candidate_remove.add(owife.id)
+                removed_fams.add(f.id)
+        if removed_fams:
+            families[:] = [f for f in families if f.id not in removed_fams]
+        # Discard a synthetic mother once nothing references her any more (her
+        # children moved to the real wife, her placeholder family was dropped).
+        if candidate_remove:
+            referenced = {x for f in families
+                          for x in (f.husband_id, f.wife_id, *f.child_ids) if x}
+            remove_inds = {i for i in candidate_remove if i not in referenced}
+
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.
     seen_ids: set[str] = set()
     ordered: list[Individual] = []
     for ind in (list(dedup_map.values()) + list(synth_by_name.values())
                 + block_created + nogen_created):
-        if ind.id not in seen_ids:
+        if ind.id not in seen_ids and ind.id not in remove_inds:
             seen_ids.add(ind.id)
             ordered.append(ind)
 

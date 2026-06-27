@@ -56,8 +56,8 @@ def test_profile_selected_by_name():
 
 def test_counts_and_integrity(parsed):
     individuals, families = parsed
-    assert len(individuals) == 313
-    assert len(families) == 103
+    assert len(individuals) == 306
+    assert len(families) == 95
     result = validate(individuals, families)
     assert result["errors"] == []
     assert result["warnings"] == []
@@ -140,6 +140,57 @@ def test_secondary_name_columns_recover_nameless_spouse(parsed):
     giles = _find(individuals, "Frederick James", "GILES")
     assert len(giles) == 1
     assert giles[0].given_name == "Frederick James"
+
+
+def test_children_homed_on_correct_wife_not_namesake(parsed):
+    # Clive Steele's children name their mother "Edna Stiff" — which must resolve
+    # to his wife Edna May Steele née Stiff (b.1917, dau. of George Stiff + Violet
+    # Taylor), NOT the namesake Edna Mary Stiff née Tracey (b.1919, "Aunty Mary"
+    # who married Albert Stiff). The consolidation re-homes the children onto the
+    # wife whose surname matches the husband's and drops the spurious family.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    allan = _find(individuals, "Allan Richard Paul", "STEELE")[0]
+    fam = next(f for f in families if allan.id in f.child_ids)
+    mother = by_id[fam.wife_id]
+    assert mother.given_name == "Edna May"
+    assert mother.birth_date == "22 SEP 1917"
+    # her parents are George Stiff + Violet Taylor, not Tracey + Jones
+    mfam = next(f for f in families if mother.id in f.child_ids)
+    assert by_id[mfam.husband_id].surname == "STIFF"
+    assert "Violet" in (by_id[mfam.wife_id].given_name or "")
+    # Aunty Mary is only ever the wife of Albert Stiff, never Clive's wife
+    mary = next(i for i in individuals
+                if i.given_name == "Edna Mary" and i.surname == "STIFF")
+    mary_husbands = {by_id[f.husband_id].given_name
+                     for f in families if f.wife_id == mary.id and f.husband_id}
+    assert mary_husbands == {"Albert Arthur"}
+
+
+def test_duplicate_synthetic_wives_consolidated(parsed):
+    # Seven mothers named given-only by their children (Jean, Doreen, Debbie,
+    # Susan, Madge, Annie, Ann) each minted a synthetic that duplicated the
+    # wife's own row, producing a spurious childless family. After consolidation
+    # each husband has a single family with his real, fully-named wife.
+    individuals, families = parsed
+    by_id = {i.id: i for i in individuals}
+    for husband_given, husband_surname in (
+            ("Herbert Campbell", "EVANS"), ("Allan E.", "LOCK"),
+            ("Albert Edward", "TAYLOR")):
+        h = _find(individuals, husband_given, husband_surname)[0]
+        wife_fams = [f for f in families if f.husband_id == h.id]
+        assert len(wife_fams) == 1
+        wife = by_id[wife_fams[0].wife_id]
+        assert wife.surname == husband_surname  # real wife, took his name
+
+
+def test_approximate_year_marker_wraps_abt(parsed):
+    # The "Approximate (A)" flag (col 32) marks a year as uncertain: a year-only
+    # date on such a row is emitted ABT (John David Evans b.1867, Robert Henry
+    # Feil b.1890), while full day/month/year dates stay exact.
+    individuals, _ = parsed
+    robert = _find(individuals, "Robert Henry", "FEIL")[0]
+    assert robert.birth_date == "ABT 1890"
 
 
 def test_unknown_given_kept_faithfully(parsed):
