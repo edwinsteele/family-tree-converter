@@ -347,6 +347,28 @@ _DECADE_RE = re.compile(
 )
 
 
+# Manual corrections for specific, identified source errors where the
+# genealogist's OWN notes supply enough to estimate the right value. Keyed by
+# (profile name, surname upper, given name). Applied only when the field is
+# otherwise empty; each carries a note recording the derivation so the assertion
+# stays transparent and reversible (preserve-don't-assert — the reasoning travels
+# with the data). Kept tiny and explicit rather than a general inference engine.
+_MANUAL_CORRECTIONS: dict[tuple[str, str, str], dict[str, str]] = {
+    # Birth cell holds the typo "152" (was emitting as the year 152 AD). The
+    # genealogist's note — "2 years 6 months younger than Eunice [Laura, b. 4 Dec
+    # 1901]; birth month may be May" — and the sibling order (Cecil 1899, Eunice
+    # 1901, Leonard, Herbert 1908) place his birth ~1904. The month stays
+    # uncertain (the note hedges "may be"), so the certain part is the year.
+    ("Stiff:Taylor", "EVANS", "Leonard George"): {
+        "birth_date": "ABT 1904",
+        "note": ("Birth year estimated ABT 1904 from the genealogist's note that "
+                 "he was 2½ years younger than his sister Eunice (b. 4 Dec 1901); "
+                 "the source's recorded \"152\" is a typo and his birth month may "
+                 "be May."),
+    },
+}
+
+
 def _parse_approx_string(s: str) -> str | None:
     """Convert informal approximate date strings to GEDCOM date phrases."""
     if s in ("?", "??", "unknown"):
@@ -2966,6 +2988,22 @@ def read_spreadsheet(
             ind.note_list.insert(
                 0, "Married surname" + ("s" if len(ind.married_surnames) > 1 else "")
                 + ": " + ", then ".join(ind.married_surnames) + ".")
+
+    # Apply manual source-error corrections (e.g. the EVANS "152" birth typo).
+    for ind in ordered:
+        corr = _MANUAL_CORRECTIONS.get(
+            (profile.name, (ind.surname or "").upper(), ind.given_name))
+        if not corr:
+            continue
+        if corr.get("birth_date") and not ind.birth_date:
+            ind.birth_date = corr["birth_date"]
+            # Drop the now-superseded auto-note that flagged the bad raw value;
+            # the correction note explains it instead.
+            ind.note_list = [n for n in ind.note_list
+                             if "too short to be a valid year" not in n]
+        note = corr.get("note")
+        if note and note not in ind.note_list:
+            ind.note_list.append(note)
 
     if diag is not None:
         # Minted-record markers: synthetic parents are the name-keyed individuals

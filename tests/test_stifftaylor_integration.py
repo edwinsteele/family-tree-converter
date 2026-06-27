@@ -63,6 +63,21 @@ def test_counts_and_integrity(parsed):
     assert result["warnings"] == []
 
 
+def test_evans_152_typo_corrected_to_estimated_year(parsed):
+    individuals, _ = parsed
+    leo = _find(individuals, "Leonard George", "EVANS")
+    assert len(leo) == 1
+    leo = leo[0]
+    # The source typo "152" must never be emitted as a date.
+    assert leo.birth_date == "ABT 1904"
+    assert all("152" not in (d or "") for d in (leo.birth_date,))
+    # The estimate carries its derivation, and the genealogist's own note stays.
+    assert any("estimated ABT 1904" in n for n in leo.note_list)
+    assert any("younger than Eunice" in n for n in leo.note_list)
+    # The superseded auto-typo note is removed (no duplication).
+    assert not any("too short to be a valid year" in n for n in leo.note_list)
+
+
 def test_no_orphans(parsed):
     individuals, families = parsed
     in_family = {
