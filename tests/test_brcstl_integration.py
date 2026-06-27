@@ -155,6 +155,22 @@ def test_approximate_year_dates_are_valid_gedcom(parsed):
     assert percy.death_date == "BET 1940 AND 1959"
 
 
+def test_approx_flag_wraps_year_only_dates(parsed):
+    # Col 34 carries the "Approx. (A)" flag (legend row 19). The three flagged
+    # rows hold year-only birth/death dates that must be wrapped ABT rather than
+    # emitted as exact years.
+    individuals, _ = parsed
+    margaret = [i for i in _find(individuals, "Margaret", "STEELE")
+                if i.birth_date == "ABT 1857"]
+    assert margaret and margaret[0].death_date == "ABT 1861"
+    harriet = _find(individuals, "Harriet E.", "STEELE")[0]
+    assert harriet.birth_date == "ABT 1860"
+    assert harriet.death_date == "ABT 1906"
+    mary = [i for i in _find(individuals, "Mary", "STEELE")
+            if i.birth_date == "ABT 1864"]
+    assert mary and mary[0].death_date == "ABT 1865"
+
+
 def test_marginal_annotation_row_excluded(parsed):
     # A generation-numbered "{2nd wife - ??}" placeholder is marginalia, not a
     # person — it must not become an individual.

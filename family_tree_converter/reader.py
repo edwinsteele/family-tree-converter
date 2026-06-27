@@ -196,6 +196,7 @@ BRCSTL_PROFILE = FormatProfile(
     longevity=33, marriage=35, married_place=36, occupation=37, notes=38,
     line_first=999,  # no lineage-membership columns
     marker=19,  # col 19: B (bloodline) / Sp (married-in spouse)
+    approx_flag=34,  # 'A' = year uncertain (legend row 19); wrap year-only dates ABT
     code_convention="none",  # no path codes; link by generation + parent names
     name_link_uncoded=True,
     data_end_row=181,  # rows 181+ are a speculative "alternatives" appendix
