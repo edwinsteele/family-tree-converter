@@ -84,6 +84,13 @@ class FormatProfile:
     # Columns whose Excel cell comments are "not for publication" and must be
     # excluded from the harvested notes. Empty when the file has no such column.
     private_note_cols: tuple[int, ...] = ()
+    # Secondary "SURNAME"/"Other Names" display columns (cols 26/27 in
+    # Stiff:Taylor). Normally an exact copy of the primary surname/given columns,
+    # but a handful of rows fill ONLY these (the primary cells left blank) — fall
+    # back to them so the person is not left nameless. None when the file has no
+    # such pair.
+    surname_alt: int | None = None
+    given_alt: int | None = None
     # Structural convention used to derive family relationships:
     #   "alpha" – col-15-style path codes (HntJm / HntJm-Ca / HntJm/Jn)
     #   "none"  – no path code; link by generation + parent names + role markers
@@ -221,6 +228,33 @@ JDJSTEELE_PROFILE = FormatProfile(
     skip_rows=((165, 185),),
 )
 
+# "Stiff:Taylor H.Tree #275" — the most entwined tree (16 people shared with the
+# other files), but structurally the cleanest of the no-code files: every one of
+# its ~280 rows is generation-numbered (col 4) and names its parents in the
+# Father/Mother columns, so the whole file links by name (Pass 4b) like Brc:Stl.
+# There are NO path codes, NO 'M'-flag marriage rows (marriage is per-person in
+# cols 33/34), no embedded sub-headers and no disavowed appendix. The role
+# markers are spread across three columns: col 16 carries Sp (married-in spouse),
+# col 15 carries X (a sibling carrying the blood-line who re-appears later as a
+# parent entry — handled by dedup, as in Brc) plus 1/2 (1st/2nd husband/wife
+# disambiguators), and col 13 carries the single Dv (divorced). col 5 is empty
+# throughout, so it doubles as the (unused) code column. cols 36/37 are
+# "not for publication". Map derived from the file's own row-16 header legend.
+STIFFTAYLOR_PROFILE = FormatProfile(
+    name="Stiff:Taylor",
+    data_start_row=17,
+    generation=4, code=5, father=18, mother=19, surname=20, given=21,
+    date1=22, flag=23, town=24, county=25, death_date=28, buried=29,
+    longevity=31, marriage=33, married_place=34, occupation=35, notes=17,
+    line_first=999,  # cols 38/39 hold bare 1s with no legend → no lineage facts
+    marker=16,  # col 16: Sp (married-in spouse)
+    status_marker=13,  # col 13: Dv (this marriage ended in divorce)
+    private_note_cols=(36, 37),  # "not for publication"
+    surname_alt=26, given_alt=27,  # dup name cols; used when primary is blank
+    code_convention="none",  # no path codes; link by generation + parent names
+    name_link_uncoded=True,
+)
+
 # Registry of known per-file profiles, keyed by a substring of the file name.
 PROFILES: dict[str, FormatProfile] = {
     "BlsGrnLivMcCl": BLSGRN_PROFILE,
@@ -228,6 +262,7 @@ PROFILES: dict[str, FormatProfile] = {
     "Hcks:Thos:Krsl": HCKS_PROFILE,
     "Brc:Stl": BRCSTL_PROFILE,
     "J & D J Steele": JDJSTEELE_PROFILE,
+    "Stiff:Taylor": STIFFTAYLOR_PROFILE,
 }
 
 
@@ -307,6 +342,13 @@ def _parse_approx_string(s: str) -> str | None:
     if s in ("?", "??", "unknown"):
         return None
 
+    # A "date" with no digit at all is prose, not a date — e.g. the marriage
+    # cell of a de-facto couple holds "Joseph & Isabella never married." Drop it
+    # so it is never emitted as a GEDCOM DATE; the relationship is preserved via
+    # the surname's [De-facto] annotation and the genealogist's cell comments.
+    if not re.search(r"\d", s):
+        return None
+
     # Normalise separators so "mid.1950s" and "mid 1950s" both match, and fold
     # a typographic apostrophe to a plain one so "Dec'91" / "Dec’91" both match.
     normalised = s.replace(".", " ").replace("’", "'").strip().lower()
@@ -352,6 +394,18 @@ def _parse_approx_string(s: str) -> str | None:
     m = re.match(r"^(\d{4})\s*(?:\?+|\(\?\))$", s.strip())
     if m:
         return f"ABT {m.group(1)}"
+
+    # Year range with a two-digit end year, "1832-37" → "BET 1832 AND 1837".
+    # Distinguished from an ISO "1908-09" date by the end value being > 12 (a
+    # month never is); the end completes the start's century, bumping forward if
+    # it would otherwise precede the start.
+    m = re.match(r"^(\d{4})-(\d{2})$", s.strip())
+    if m and int(m.group(2)) > 12:
+        start = int(m.group(1))
+        end = (start // 100) * 100 + int(m.group(2))
+        if end < start:
+            end += 100
+        return f"BET {start} AND {end}"
 
     # ISO "1908-09-05" → "5 SEP 1908"; "1908-09" → "SEP 1908"
     m = re.match(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$", s.strip())
@@ -416,6 +470,13 @@ def _parse_approx_string(s: str) -> str | None:
     m = re.match(r"^(?:early|mid|late)\s+(\d{4})$", normalised)
     if m:
         return m.group(1)
+
+    # "early/mid/late MONTH YYYY" → "MONTH YYYY": same as above, the month and
+    # year are certain and only the intra-month timing (inexpressible in GEDCOM)
+    # is qualified — "late Feb 1994" → "FEB 1994".
+    m = re.match(r"^(?:early|mid|late)\s+([a-z]+)\s+(\d{4})$", normalised)
+    if m and m.group(1) in _MONTH_NAMES:
+        return f"{_MONTH_NAMES[m.group(1)]} {m.group(2)}"
 
     return s  # pass through unchanged; writer will emit as-is
 
@@ -631,6 +692,23 @@ def _strip_nee(surname: str) -> str:
     s = re.sub(r"\s*\[.*?\]", "", surname)
     s = re.sub(r"\s*\(.*?\)", "", s)
     return s.strip()
+
+
+def _surname_annotation(surname: str) -> str | None:
+    """Return a square-bracket surname annotation that is NOT a née clause.
+
+    Stiff:Taylor marks a partner in an unmarried union with '[De-facto]' on the
+    surname (e.g. 'TAYLOR  [De-facto]'); _strip_nee removes it, so capture it
+    here to preserve the relationship status as a NOTE. née clauses are handled
+    by _maiden_name and are not returned.
+    """
+    m = re.search(r"\[([^\]]+)\]", surname)
+    if not m:
+        return None
+    content = m.group(1).strip()
+    if re.match(r"n[ée]e\b", content, re.IGNORECASE):
+        return None
+    return content
 
 
 def _clean_given(given: str) -> tuple[str, str | None, str | None]:
@@ -871,6 +949,7 @@ def read_spreadsheet(
         p.occupation, p.notes, p.line_first)
     _C_MARKER = p.marker
     _C_STATUS = p.status_marker
+    _C_SURNAME_ALT, _C_GIVEN_ALT = p.surname_alt, p.given_alt
 
     def v(r: int, col: int) -> Any:
         return ws.cell(r, col).value
@@ -1057,12 +1136,20 @@ def read_spreadsheet(
             })
         elif _is_person_row(r, code, generation):
             surname = str(v(r, _C_SURNAME)).strip()
+            given_raw = str(v(r, _C_GIVEN)).strip()
+            # A few rows fill ONLY the secondary "SURNAME"/"Other Names" display
+            # columns, leaving the primary name cells blank (e.g. Stiff:Taylor's
+            # Frederick James Giles); fall back to them so the person is named.
+            if (not surname and not given_raw
+                    and _C_SURNAME_ALT is not None):
+                surname = str(v(r, _C_SURNAME_ALT)).strip()
+                given_raw = str(v(r, _C_GIVEN_ALT)).strip()
             # A generation-numbered marginal annotation with no real name (e.g.
             # Brc:Stl's "{2nd wife - ??}" placeholder) is not an individual.
             if (profile.code_convention == "none" and not _strip_nee(surname)
-                    and re.fullmatch(r"\{.*\}", str(v(r, _C_GIVEN)).strip())):
+                    and re.fullmatch(r"\{.*\}", given_raw)):
                 continue
-            given, given_annotation, nickname = _clean_given(str(v(r, _C_GIVEN)).strip())
+            given, given_annotation, nickname = _clean_given(given_raw)
             father = str(v(r, _C_FATHER)).strip()
             surname_base = _strip_nee(surname)
             marker = mv(r)
@@ -1072,6 +1159,15 @@ def read_spreadsheet(
             person_notes = list(row_notes.get(r, []))
             if given_annotation:
                 person_notes.append(f"Name annotation: [{given_annotation}].")
+            # A non-née square-bracket surname tag (Stiff:Taylor's '[De-facto]')
+            # marks the relationship status and is stripped from the surname;
+            # preserve it as a note. Gated to the no-code files so the coded
+            # reference/C&A output (whose '(Maiden Name)' tags are paren, not
+            # bracket) is unchanged.
+            if profile.name_link_uncoded:
+                sa = _surname_annotation(surname)
+                if sa:
+                    person_notes.append(f'Relationship recorded as "{sa}".')
             # A parent column holding only an editorial tag (e.g. "[Adopted]")
             # names no real ancestor; the tag is dropped from parent linking, so
             # preserve its meaning here as a note on the child. Gated to the
@@ -2573,6 +2669,109 @@ def read_spreadsheet(
             if (fam.husband_id in divorced_spouse_ids
                     or fam.wife_id in divorced_spouse_ids):
                 fam.divorced = True
+
+    # Maiden-aware same-person merge (no-code files). A née woman recorded once
+    # under her birth surname and once under a married surname keeps two dedup
+    # keys, so the surname-keyed Pass 2b misses her and she builds two separate
+    # records — each correctly married into its own family. When her given name,
+    # BOTH parent names and the exact birth date match another individual she is
+    # certainly one person (the genealogist flags the re-appearance with the 'X'
+    # marker): merge the married-name record onto the birth-name one, repoint her
+    # families, and keep the married surname. Run AFTER all families are built so
+    # BOTH of her marriages survive — e.g. Stiff:Taylor's Isabella Taylor,
+    # de-facto partner of Joseph Bowden and later wife of Charles Mullins, born
+    # 19 Feb 1851 to John Taylor & Eliza Conway.
+    if profile.code_convention == "none":
+        def _fw(s: str | None) -> str:
+            s = (s or "").lower().split("(")[0].strip()
+            return s.split()[0] if s.split() else "?"
+
+        def _ident(surname_up: str, prow: dict) -> tuple:
+            return (surname_up, _fw(prow["given"]), _fw(prow["father_raw"]),
+                    _fw(prow["mother_raw"]), prow["birth_date"])
+
+        birth_identity: dict[tuple, Individual] = {}
+        for prow in person_rows:
+            if _has_full_date(prow["birth_date"]):
+                ind = dedup_map.get(prow["dedup_key"])
+                if ind is not None:
+                    birth_identity.setdefault(
+                        _ident(prow["surname_base"].upper(), prow), ind)
+        merged_any = False
+        for prow in person_rows:
+            maiden = prow["maiden"]
+            if not maiden or not _has_full_date(prow["birth_date"]):
+                continue
+            ind = dedup_map.get(prow["dedup_key"])
+            canon = birth_identity.get(_ident(maiden.upper(), prow))
+            if ind is None or canon is None or canon is ind:
+                continue
+            married = ind.surname
+            if (married and married.upper() != (canon.surname or "").upper()
+                    and married not in canon.married_surnames):
+                canon.married_surnames.append(married)
+            _merge_into(canon, ind)
+            for fam in families:
+                if fam.husband_id == ind.id:
+                    fam.husband_id = canon.id
+                if fam.wife_id == ind.id:
+                    fam.wife_id = canon.id
+                if ind.id in fam.child_ids:
+                    fam.child_ids = [canon.id if c == ind.id else c
+                                     for c in fam.child_ids]
+            for dk2, v2 in list(dedup_map.items()):
+                if v2 is ind:
+                    dedup_map[dk2] = canon
+            merged_any = True
+        if merged_any:
+            # The two appearances often share a parent family, so the merged
+            # person can land in one child list twice — collapse duplicates.
+            for fam in families:
+                seen: set[str] = set()
+                fam.child_ids = [c for c in fam.child_ids
+                                 if not (c in seen or seen.add(c))]
+
+    # A partner recorded with a non-née '[De-facto]' surname tag never married
+    # into that union, so the family must carry no marriage event — yet the other
+    # spouse's per-person date may legitimately belong to a *different*, legal
+    # marriage and have been copied onto this family too (Stiff:Taylor's Henry
+    # Joseph Bowden was de-facto with Isabella Taylor but married Elizabeth
+    # Goscomb in 1885; that date wrongly reached the Isabella family). The de-
+    # facto mate is the nearest preceding person at the same generation; clear
+    # that family's marriage date/place and note the de-facto status. No-code
+    # files only.
+    if profile.name_link_uncoded:
+        rows_by_num = sorted(person_rows, key=lambda pr: pr["row"])
+        ind_gen: dict[str, float] = {}
+        for pr in person_rows:
+            g = v(pr["row"], _C_GENERATION)
+            if isinstance(g, float):
+                ind_gen.setdefault(dedup_map[pr["dedup_key"]].id, g)
+        for idx, pr in enumerate(rows_by_num):
+            sa = _surname_annotation(pr["surname"])
+            if not sa or "de-facto" not in sa.lower():
+                continue
+            partner = dedup_map[pr["dedup_key"]]
+            pgen = ind_gen.get(partner.id)
+            # The mate is the nearest preceding bloodline person (not another
+            # married-in 'Sp' spouse — that would be a co-wife) at the same
+            # generation as the de-facto partner.
+            mate_id = None
+            for prev in reversed(rows_by_num[:idx]):
+                pid = dedup_map[prev["dedup_key"]].id
+                if (pid != partner.id and ind_gen.get(pid) == pgen
+                        and prev.get("marker") != "Sp"):
+                    mate_id = pid
+                    break
+            if mate_id is None:
+                continue
+            for fam in families:
+                if {partner.id, mate_id} <= {fam.husband_id, fam.wife_id}:
+                    fam.marriage_date = fam.marriage_place = None
+                    note = ("Recorded as a de-facto relationship; "
+                            "the couple never married.")
+                    if note not in fam.note_list:
+                        fam.note_list.append(note)
 
     # Pass 2b can point several dedup keys at one merged individual, so
     # de-duplicate the final list by identity while preserving order.

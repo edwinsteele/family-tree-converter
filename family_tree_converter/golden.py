@@ -31,6 +31,7 @@ CONVERTED_FILES = [
     "Hcks:Thos:Krsl H.Tr.#120",
     "Brc:Stl H.Tree #46",
     "J & D J Steele H.Tree #30",
+    "Stiff:Taylor H.Tree #275",
 ]
 
 

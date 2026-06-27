@@ -40,6 +40,14 @@ from family_tree_converter.reader import _date_precision_note, _parse_approx_str
         ("c Jan'05", "ABT JAN 2005"),
         ("Mar'29", "MAR 2029"),  # windowed: '00-'29 → 2000s
         ("Mar'30", "MAR 1930"),  # windowed: '30-'99 → 1900s
+        # two-digit-end year range (end > 12 distinguishes it from ISO month)
+        ("1832-37", "BET 1832 AND 1837"),
+        ("1908-09", "SEP 1908"),  # end <= 12 stays an ISO month, not a range
+        # early/mid/late + month + year: only intra-month timing is qualified
+        ("late Feb 1994", "FEB 1994"),
+        ("early Jan 1900", "JAN 1900"),
+        # prose with no digit (e.g. a de-facto marriage cell) is not a date
+        ("Joseph & Isabella never married.", None),
         # unknown → dropped
         ("?", None),
     ],
