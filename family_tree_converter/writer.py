@@ -76,11 +76,17 @@ def render_gedcom(
     for ind in individuals:
         lines.append(f"0 @{ind.id}@ INDI")
         lines.append(f"1 NAME {ind.given_name} /{ind.surname}/")
-        if ind.nickname:
-            # Formal given name plus a structured nickname, so the familiar form
-            # ("Edie or Cissy") is a proper GEDCOM nickname rather than embedded
-            # in the name field.
+        # Standard GEDCOM 5.5.1 name pieces: GIVN holds ALL given names together
+        # (the standard has no separate middle-name field) and SURN the surname.
+        # Kept fully standard for portability to every importer; MacFamilyTree
+        # shows the whole given name as the First Name.
+        if ind.given_name:
             lines.append(f"2 GIVN {ind.given_name}")
+        if ind.surname:
+            lines.append(f"2 SURN {ind.surname}")
+        if ind.nickname:
+            # The familiar form ("Edie or Cissy") as a proper GEDCOM nickname
+            # rather than embedded in the name field.
             lines.append(f"2 NICK {ind.nickname}")
         if ind.sex:
             lines.append(f"1 SEX {ind.sex}")

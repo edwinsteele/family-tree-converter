@@ -200,7 +200,22 @@ def test_write_gedcom_produces_valid_structure(sample_family, tmp_path):
     assert "0 TRLR" in content
     assert "0 @I1@ INDI" in content
     assert "1 NAME John /Smith/" in content
+    # A single given name yields GIVN + SURN but no SECG (no middle names).
+    assert "2 GIVN John" in content
+    assert "2 SURN Smith" in content
     assert "2 DATE 1 JAN 1900" in content
     assert "0 @F1@ FAM" in content
     assert "1 HUSB @I1@" in content
     assert "1 CHIL @I3@" in content
+
+
+def test_name_pieces_are_standard_no_middle_split():
+    # GEDCOM 5.5.1 has no separate middle-name field: all given names stay
+    # together in GIVN (the full given name), with no proprietary SECG split.
+    ind = Individual(id="I1", given_name="Edwin Richard Paul", surname="STEELE")
+    from family_tree_converter.writer import render_gedcom
+    out = render_gedcom([ind], [])
+    assert "1 NAME Edwin Richard Paul /STEELE/" in out
+    assert "2 GIVN Edwin Richard Paul" in out
+    assert "2 SURN STEELE" in out
+    assert "SECG" not in out

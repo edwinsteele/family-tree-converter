@@ -263,8 +263,27 @@ class MergeResult:
     ancestors_unified: int = 0
 
 
+def _more_complete_given(a: str, b: str) -> str:
+    """Whichever given name carries the more complete set of middle names.
+
+    Only acts when the two share the same first word and one is a prefix of the
+    other ("Edith" vs "Edith Rosetta") — then the longer form wins, so a merge
+    does not drop a person's middle names. Returns ``a`` when they diverge, so an
+    ambiguous difference never silently rewrites the canonical name.
+    """
+    ta, tb = (a or "").split(), (b or "").split()
+    if ta and tb and ta[0].lower() == tb[0].lower():
+        n = min(len(ta), len(tb))
+        if [t.lower() for t in ta[:n]] == [t.lower() for t in tb[:n]]:
+            return a if len(ta) >= len(tb) else b
+    return a or b
+
+
 def _fill_blanks(dst: Individual, src: Individual) -> None:
     """Union ``src`` into the canonical ``dst`` without overwriting set data."""
+    # Keep the most complete given name so unifying e.g. the dateless "Edith"
+    # synthetic with "Edith Rosetta" keeps "Rosetta" (the first name is unchanged).
+    dst.given_name = _more_complete_given(dst.given_name, src.given_name)
     for attr in ("nickname", "birth_date", "birth_place", "death_date",
                  "death_place", "sex", "occupation", "notes"):
         if getattr(dst, attr) in (None, "") and getattr(src, attr):
